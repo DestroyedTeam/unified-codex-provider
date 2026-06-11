@@ -10,6 +10,8 @@ session visibility while switching profiles.
 
 ## Engineering Rules
 
+- Create a dedicated `codex/<task>` branch before changing files. Do not stack
+  unrelated work on an existing task, release, or cleanup branch.
 - Never print, commit, or include real tokens, API keys, or `auth.json` data in
   tests and documentation.
 - Treat a profile as an account/provider identity and `model_provider` as the

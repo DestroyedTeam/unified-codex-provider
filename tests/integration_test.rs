@@ -59,10 +59,13 @@ fn test_version() {
 
 #[test]
 fn test_status_runs() {
+    let home = temp_home("status_test");
     let output = Command::new(ucp_bin())
+        .env("HOME", &home)
         .arg("status")
         .output()
         .expect("Failed to run ucp");
+    let _ = fs::remove_dir_all(&home);
     // Should succeed even without prior setup
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -71,10 +74,13 @@ fn test_status_runs() {
 
 #[test]
 fn test_list_runs() {
+    let home = temp_home("list_test");
     let output = Command::new(ucp_bin())
+        .env("HOME", &home)
         .arg("list")
         .output()
         .expect("Failed to run ucp");
+    let _ = fs::remove_dir_all(&home);
     assert!(output.status.success());
 }
 
@@ -104,10 +110,13 @@ fn test_list_warns_about_duplicate_chatgpt_auth_snapshots() {
 
 #[test]
 fn test_switch_nonexistent_profile() {
+    let home = temp_home("missing_profile_test");
     let output = Command::new(ucp_bin())
+        .env("HOME", &home)
         .args(["switch", "nonexistent_provider_xyz"])
         .output()
         .expect("Failed to run ucp");
+    let _ = fs::remove_dir_all(&home);
     // Should fail gracefully
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);

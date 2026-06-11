@@ -466,7 +466,9 @@ complete -c ucp -n '__fish_seen_subcommand_from add' -l auto-compact-limit -d 'A
 fn acquire_lock() -> Result<std::fs::File> {
     use fs2::FileExt;
     use std::io::Write;
-    let lock_path = config::codex_dir().join(".ucp.lock");
+    let codex_dir = config::codex_dir();
+    std::fs::create_dir_all(&codex_dir)?;
+    let lock_path = codex_dir.join(".ucp.lock");
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
