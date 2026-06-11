@@ -116,6 +116,12 @@ enum Commands {
         /// Optional prefix to filter candidates
         prefix: Option<String>,
     },
+    /// Clean old session backups to reclaim disk space
+    Clean {
+        /// Number of recent backups to keep (default: 3)
+        #[arg(long, default_value_t = 3)]
+        keep: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -259,6 +265,11 @@ fn main() -> Result<()> {
             println!("Profile '{}' created.", name);
         }
         Commands::Completions { .. } | Commands::Complete { .. } => {}
+        Commands::Clean { keep } => {
+            println!("Cleaning old session backups (keeping {})...", keep);
+            sessions::prune_session_backups(keep);
+            println!("Done.");
+        }
     }
     Ok(())
 }

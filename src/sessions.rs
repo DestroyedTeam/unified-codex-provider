@@ -55,7 +55,38 @@ pub fn unify_sessions(target_provider: &str, target_model: &str) -> Result<(usiz
         let _ = fs::remove_dir(&backup_dir);
     }
 
+    // Retain only the 3 most recent session backups to prevent unbounded disk growth.
+    prune_session_backups(3);
+
     Ok((modified, skipped, errors))
+}
+
+/// Remove old `.sessions_backup_*` directories, keeping only the most recent `keep` entries.
+pub fn prune_session_backups(keep: usize) {
+    let base = codex_dir();
+    let mut backups: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".sessions_backup_") && entry.path().is_dir() {
+                backups.push(name);
+            }
+        }
+    }
+    if backups.len() <= keep {
+        return;
+    }
+    // Sort ascending by name (timestamp suffix gives chronological order).
+    backups.sort();
+    let to_remove = backups.len() - keep;
+    for name in backups.iter().take(to_remove) {
+        let path = base.join(name);
+        if let Err(e) = fs::remove_dir_all(&path) {
+            eprintln!("  Warning: failed to remove old backup {}: {}", name, e);
+        } else {
+            println!("  Pruned old session backup: {}", name);
+        }
+    }
 }
 
 /// Process a single session file: update every existing model_provider field,
