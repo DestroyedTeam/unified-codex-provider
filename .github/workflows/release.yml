@@ -18,7 +18,9 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
+          # GitHub retired macOS 13 Intel runners; macos-15-intel is the
+          # supported x86_64 label for public repositories until August 2027.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v6
