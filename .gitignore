@@ -1,0 +1,11 @@
+/target
+.idea/
+*.swp
+*.swo
+.DS_Store
+.env
+.env.*
+*.auth.json
+*.key
+*.p12
+*.pem
