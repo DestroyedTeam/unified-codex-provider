@@ -20,29 +20,39 @@ visibility.
 
 ## Requirements
 
-- Rust 1.75 or newer for source installation.
 - Codex CLI available in `PATH` for `ucp login`.
-- macOS for the LaunchAgent helper scripts. Core CLI behavior is also tested on
+- macOS for auto-sync LaunchAgent support. Core CLI behavior is also tested on
   Linux.
 
-## Install From Source
+## Install
 
 ```bash
-git clone https://github.com/DestroyedTeam/unified-codex-provider.git
-cd unified-codex-provider
-cargo install --path .
-ucp --help
+brew install DestroyedTeam/tap/ucp
+ucp setup
 ```
 
-Signed macOS packages and Homebrew installation are planned for a future
-release.
+`ucp setup` creates the local UCP state directory, migrates legacy Codex
+provider files when present, installs the macOS auto-sync service, and runs a
+diagnostic check.
+
+To install without the macOS auto-sync service:
+
+```bash
+ucp setup --no-service
+```
+
+Source installation is also supported for development:
+
+```bash
+cargo install --path .
+```
 
 ## Quick Start
 
 Migrate existing Codex configuration:
 
 ```bash
-ucp init
+ucp setup
 ucp list
 ucp status
 ```
@@ -93,18 +103,36 @@ without regenerating the completion file.
 
 ## macOS Auto-Sync
 
-The checked-in plist is a template and contains no user-specific paths. Install
-the per-user LaunchAgent after `ucp` is available in `PATH`:
+Install, inspect, or remove the per-user LaunchAgent:
 
 ```bash
-./scripts/install-launch-agent.sh
+ucp service install
+ucp service status
+ucp service uninstall
 ```
 
-Remove it without touching Codex profiles or authentication data:
+The LaunchAgent watches `~/.codex/auth.json` and `~/.codex/config.toml`, then
+runs `ucp sync --auto`. The generated plist contains user-specific paths, so it
+is created locally and is not checked into the repository.
+
+## Diagnostics
 
 ```bash
-./scripts/uninstall-launch-agent.sh
+ucp doctor
 ```
+
+`doctor` reports the current binary path, Codex CLI availability, config/auth
+files, profiles, active state, LaunchAgent status, and duplicate ChatGPT auth
+snapshot warnings.
+
+## Homebrew Tap
+
+```bash
+brew install DestroyedTeam/tap/ucp
+```
+
+The tap formula downloads prebuilt release artifacts for Apple Silicon and
+Intel macOS.
 
 ## Data Layout
 

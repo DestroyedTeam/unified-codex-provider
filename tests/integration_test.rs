@@ -44,6 +44,9 @@ fn test_help_output() {
     assert!(stdout.contains("remove"));
     assert!(stdout.contains("list"));
     assert!(stdout.contains("init"));
+    assert!(stdout.contains("setup"));
+    assert!(stdout.contains("doctor"));
+    assert!(stdout.contains("service"));
 }
 
 #[test]
@@ -82,6 +85,40 @@ fn test_list_runs() {
         .expect("Failed to run ucp");
     let _ = fs::remove_dir_all(&home);
     assert!(output.status.success());
+}
+
+#[test]
+fn test_doctor_runs_with_empty_home() {
+    let home = temp_home("doctor_test");
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .arg("doctor")
+        .output()
+        .expect("Failed to run ucp doctor");
+    let _ = fs::remove_dir_all(&home);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("UCP doctor"));
+    assert!(stdout.contains("Codex home"));
+}
+
+#[test]
+fn test_setup_no_service_creates_codex_home() {
+    let home = temp_home("setup_test");
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .args(["setup", "--no-service"])
+        .output()
+        .expect("Failed to run ucp setup");
+
+    assert!(output.status.success());
+    assert!(home.join(".codex").exists());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("UCP setup"));
+    assert!(stdout.contains("Service: skipped"));
+
+    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]

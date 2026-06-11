@@ -3,7 +3,9 @@ mod config;
 mod migrate;
 mod oauth;
 mod provider;
+mod service;
 mod sessions;
+mod setup;
 mod sync;
 
 use anyhow::Result;
@@ -88,6 +90,19 @@ enum Commands {
         #[arg(long)]
         auto: bool,
     },
+    /// Run first-time setup checks and optional macOS auto-sync install
+    Setup {
+        /// Skip macOS LaunchAgent installation
+        #[arg(long)]
+        no_service: bool,
+    },
+    /// Diagnose the local UCP/Codex environment
+    Doctor,
+    /// Manage the macOS auto-sync LaunchAgent
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     /// Generate shell completion script
     Completions {
         /// Shell to generate completions for
@@ -101,6 +116,16 @@ enum Commands {
         /// Optional prefix to filter candidates
         prefix: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install or update the per-user LaunchAgent
+    Install,
+    /// Show LaunchAgent installation and runtime status
+    Status,
+    /// Unload and remove the per-user LaunchAgent
+    Uninstall,
 }
 
 fn main() -> Result<()> {
@@ -157,6 +182,19 @@ fn main() -> Result<()> {
                 println!("Sync complete.");
             }
         }
+        Commands::Setup { no_service } => {
+            setup::run_setup(setup::SetupOptions {
+                install_service: !no_service,
+            })?;
+        }
+        Commands::Doctor => {
+            setup::run_doctor()?;
+        }
+        Commands::Service { command } => match command {
+            ServiceCommand::Install => service::install_launch_agent()?,
+            ServiceCommand::Status => service::show_launch_agent_status()?,
+            ServiceCommand::Uninstall => service::uninstall_launch_agent()?,
+        },
         Commands::Init => {
             migrate::init_migrate()?;
         }
@@ -303,7 +341,7 @@ const BASH_COMPLETION: &str = r#"_ucp()
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "status list switch remove delete rm add init import-auth login sync completions" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "status list switch remove delete rm add init import-auth login sync setup doctor service completions" -- "${cur}") )
         return 0
     fi
 
@@ -333,6 +371,12 @@ const BASH_COMPLETION: &str = r#"_ucp()
             ;;
         sync)
             COMPREPLY=( $(compgen -W "--auto" -- "${cur}") )
+            ;;
+        setup)
+            COMPREPLY=( $(compgen -W "--no-service" -- "${cur}") )
+            ;;
+        service)
+            COMPREPLY=( $(compgen -W "install status uninstall" -- "${cur}") )
             ;;
         login)
             COMPREPLY=( $(compgen -W "--name --model --model-provider --switch" -- "${cur}") )
@@ -365,6 +409,9 @@ _ucp()
         'import-auth:Import auth snapshots'
         'login:Login to OpenAI and save a profile'
         'sync:Run provider/session sync'
+        'setup:Run first-time setup'
+        'doctor:Diagnose local environment'
+        'service:Manage macOS auto-sync service'
         'completions:Generate shell completion script'
     )
 
@@ -406,6 +453,12 @@ _ucp()
                 sync)
                     _arguments '--auto[Run LaunchAgent-style auto sync]'
                     ;;
+                setup)
+                    _arguments '--no-service[Skip macOS LaunchAgent installation]'
+                    ;;
+                service)
+                    _values 'service command' install status uninstall
+                    ;;
                 login)
                     _arguments \
                         '--name[Profile name]:name:' \
@@ -441,6 +494,9 @@ complete -c ucp -n '__fish_is_first_arg' -a 'init' -d 'Migrate legacy config fil
 complete -c ucp -n '__fish_is_first_arg' -a 'import-auth' -d 'Import auth snapshots'
 complete -c ucp -n '__fish_is_first_arg' -a 'login' -d 'Login to OpenAI and save a profile'
 complete -c ucp -n '__fish_is_first_arg' -a 'sync' -d 'Run provider/session sync'
+complete -c ucp -n '__fish_is_first_arg' -a 'setup' -d 'Run first-time setup'
+complete -c ucp -n '__fish_is_first_arg' -a 'doctor' -d 'Diagnose local environment'
+complete -c ucp -n '__fish_is_first_arg' -a 'service' -d 'Manage macOS auto-sync service'
 complete -c ucp -n '__fish_is_first_arg' -a 'completions' -d 'Generate shell completion script'
 complete -c ucp -n '__fish_seen_subcommand_from switch' -a '(ucp __complete profile (commandline -ct) 2>/dev/null)' -d 'Provider profile'
 complete -c ucp -n '__fish_seen_subcommand_from remove delete rm; and not string match -q -- "-*" (commandline -ct)' -a '(ucp __complete profile (commandline -ct) 2>/dev/null)' -d 'Provider profile'
@@ -450,6 +506,8 @@ complete -c ucp -n '__fish_seen_subcommand_from import-auth' -l all -d 'Import a
 complete -c ucp -n '__fish_seen_subcommand_from import-auth; and not string match -q -- "-*" (commandline -ct)' -a '(ucp __complete profile (commandline -ct) 2>/dev/null)' -d 'Provider profile'
 complete -c ucp -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
 complete -c ucp -n '__fish_seen_subcommand_from sync' -l auto -d 'Run LaunchAgent-style auto sync'
+complete -c ucp -n '__fish_seen_subcommand_from setup' -l no-service -d 'Skip macOS LaunchAgent installation'
+complete -c ucp -n '__fish_seen_subcommand_from service' -a 'install status uninstall'
 complete -c ucp -n '__fish_seen_subcommand_from login' -l name -d 'Profile name' -r
 complete -c ucp -n '__fish_seen_subcommand_from login' -l model -d 'Model name' -r
 complete -c ucp -n '__fish_seen_subcommand_from login' -l model-provider -d 'Runtime model provider key' -r
