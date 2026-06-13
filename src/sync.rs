@@ -79,12 +79,15 @@ pub fn switch_provider(profile_name: &str, rewrite_rollouts: bool) -> Result<()>
     let session_summary = sessions::unify_sessions(
         &profile.provider.model_provider,
         &profile.provider.model,
-        sessions::SessionSyncOptions { rewrite_rollouts },
+        sessions::SessionSyncOptions {
+            full_rollout_rewrite: rewrite_rollouts,
+        },
     )?;
     println!(
-        "  Rollouts: {} modified, {} skipped, {} errors; DB: {} rows, {} errors",
+        "  Rollouts: {} modified, {} skipped, {} metadata lines, {} errors; DB: {} rows, {} errors",
         session_summary.rollouts_modified,
         session_summary.rollouts_skipped,
+        session_summary.metadata_lines_updated,
         session_summary.rollout_errors,
         session_summary.db_records_updated,
         session_summary.db_errors
@@ -186,7 +189,9 @@ pub fn auto_sync_with_options(rewrite_rollouts: bool) -> Result<()> {
             let summary = sessions::unify_sessions(
                 &current_provider,
                 &profile.provider.model,
-                sessions::SessionSyncOptions { rewrite_rollouts },
+                sessions::SessionSyncOptions {
+                    full_rollout_rewrite: rewrite_rollouts,
+                },
             )?;
             if summary.rollouts_modified > 0
                 || summary.rollout_errors > 0
@@ -194,8 +199,9 @@ pub fn auto_sync_with_options(rewrite_rollouts: bool) -> Result<()> {
                 || summary.db_errors > 0
             {
                 println!(
-                    "  Sessions: {} rollout(s) modified, {} DB row(s), {} error(s)",
+                    "  Sessions: {} rollout(s), {} metadata line(s), {} DB row(s), {} error(s)",
                     summary.rollouts_modified,
+                    summary.metadata_lines_updated,
                     summary.db_records_updated,
                     summary.rollout_errors + summary.db_errors
                 );
@@ -256,7 +262,9 @@ pub fn auto_sync_with_options(rewrite_rollouts: bool) -> Result<()> {
     let summary = sessions::unify_sessions(
         &current_provider,
         target_model,
-        sessions::SessionSyncOptions { rewrite_rollouts },
+        sessions::SessionSyncOptions {
+            full_rollout_rewrite: rewrite_rollouts,
+        },
     )?;
     if summary.rollouts_modified > 0
         || summary.rollout_errors > 0
@@ -264,8 +272,9 @@ pub fn auto_sync_with_options(rewrite_rollouts: bool) -> Result<()> {
         || summary.db_errors > 0
     {
         println!(
-            "  Sessions: {} rollout(s) modified, {} DB row(s), {} error(s)",
+            "  Sessions: {} rollout(s), {} metadata line(s), {} DB row(s), {} error(s)",
             summary.rollouts_modified,
+            summary.metadata_lines_updated,
             summary.db_records_updated,
             summary.rollout_errors + summary.db_errors
         );

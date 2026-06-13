@@ -28,7 +28,7 @@ enum Commands {
     Switch {
         /// Provider profile name
         name: String,
-        /// Danger: rewrite historical rollout JSONL metadata after backing it up
+        /// Danger: full rewrite of historical rollout JSONL rows after backing them up
         #[arg(long)]
         rewrite_rollouts: bool,
     },
@@ -92,7 +92,7 @@ enum Commands {
     Sync {
         #[arg(long)]
         auto: bool,
-        /// Danger: rewrite historical rollout JSONL metadata after backing it up
+        /// Danger: full rewrite of historical rollout JSONL rows after backing them up
         #[arg(long)]
         rewrite_rollouts: bool,
     },
@@ -295,7 +295,7 @@ fn main() -> Result<()> {
 fn warn_rollout_rewrite(enabled: bool) {
     if enabled {
         println!(
-            "⚠ --rewrite-rollouts is enabled: historical rollout JSONL will be rewritten after backup. Use only for explicit repair."
+            "⚠ --rewrite-rollouts is enabled: every historical rollout JSONL row may be reserialized after backup. Use only for explicit repair."
         );
     }
 }
@@ -466,7 +466,7 @@ _ucp()
             case "$line[1]" in
                 switch)
                     if [[ "$words[CURRENT]" == -* ]]; then
-                        _arguments '--rewrite-rollouts[Danger: rewrite historical rollout JSONL metadata after backup]'
+                        _arguments '--rewrite-rollouts[Danger: full rewrite of historical rollout JSONL rows after backup]'
                     else
                         profiles=("${(@f)$(_call_program profiles ucp __complete profile "$PREFIX" 2>/dev/null)}")
                         _describe -t profiles 'provider profile' profiles
@@ -496,7 +496,7 @@ _ucp()
                 sync)
                     _arguments \
                         '--auto[Run LaunchAgent-style auto sync]' \
-                        '--rewrite-rollouts[Danger: rewrite historical rollout JSONL metadata after backup]'
+                        '--rewrite-rollouts[Danger: full rewrite of historical rollout JSONL rows after backup]'
                     ;;
                 setup)
                     _arguments '--no-service[Skip macOS LaunchAgent installation]'
@@ -544,7 +544,7 @@ complete -c ucp -n '__fish_is_first_arg' -a 'doctor' -d 'Diagnose local environm
 complete -c ucp -n '__fish_is_first_arg' -a 'service' -d 'Manage macOS auto-sync service'
 complete -c ucp -n '__fish_is_first_arg' -a 'completions' -d 'Generate shell completion script'
 complete -c ucp -n '__fish_seen_subcommand_from switch' -a '(ucp __complete profile (commandline -ct) 2>/dev/null)' -d 'Provider profile'
-complete -c ucp -n '__fish_seen_subcommand_from switch' -l rewrite-rollouts -d 'Danger: rewrite historical rollout JSONL metadata after backup'
+complete -c ucp -n '__fish_seen_subcommand_from switch' -l rewrite-rollouts -d 'Danger: full rewrite of historical rollout JSONL rows after backup'
 complete -c ucp -n '__fish_seen_subcommand_from remove delete rm; and not string match -q -- "-*" (commandline -ct)' -a '(ucp __complete profile (commandline -ct) 2>/dev/null)' -d 'Provider profile'
 complete -c ucp -n '__fish_seen_subcommand_from remove delete rm' -l force -d 'Allow removing the active profile'
 complete -c ucp -n '__fish_seen_subcommand_from remove delete rm' -l keep-auth -d 'Keep auth snapshot'
@@ -552,7 +552,7 @@ complete -c ucp -n '__fish_seen_subcommand_from import-auth' -l all -d 'Import a
 complete -c ucp -n '__fish_seen_subcommand_from import-auth; and not string match -q -- "-*" (commandline -ct)' -a '(ucp __complete profile (commandline -ct) 2>/dev/null)' -d 'Provider profile'
 complete -c ucp -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
 complete -c ucp -n '__fish_seen_subcommand_from sync' -l auto -d 'Run LaunchAgent-style auto sync'
-complete -c ucp -n '__fish_seen_subcommand_from sync' -l rewrite-rollouts -d 'Danger: rewrite historical rollout JSONL metadata after backup'
+complete -c ucp -n '__fish_seen_subcommand_from sync' -l rewrite-rollouts -d 'Danger: full rewrite of historical rollout JSONL rows after backup'
 complete -c ucp -n '__fish_seen_subcommand_from setup' -l no-service -d 'Skip macOS LaunchAgent installation'
 complete -c ucp -n '__fish_seen_subcommand_from service' -a 'install status uninstall'
 complete -c ucp -n '__fish_seen_subcommand_from login' -l name -d 'Profile name' -r

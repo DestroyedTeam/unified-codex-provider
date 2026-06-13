@@ -9,7 +9,7 @@ use crate::config::codex_dir;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionSyncOptions {
-    pub rewrite_rollouts: bool,
+    pub full_rollout_rewrite: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -17,6 +17,7 @@ pub struct SessionSyncSummary {
     pub rollouts_modified: usize,
     pub rollouts_skipped: usize,
     pub rollout_errors: usize,
+    pub metadata_lines_updated: usize,
     pub db_records_updated: usize,
     pub db_backup_files: usize,
     pub db_errors: usize,
@@ -31,11 +32,11 @@ struct DbUpdateSummary {
 
 /// Unify session visibility for the given model_provider and model.
 ///
-/// By default rollout JSONL files are treated as append-only audit logs and are
-/// left untouched. Codex Desktop discovers historical threads through SQLite
-/// indexes, so the default sync updates those indexes only. Rewriting rollout
-/// metadata remains available as an explicit recovery operation through
-/// `SessionSyncOptions::rewrite_rollouts`.
+/// By default only rollout metadata rows are rewritten: `session_meta` carries
+/// the provider identity and `turn_context` carries the model. Tool calls,
+/// command outputs, assistant messages, and other event rows remain byte-for-
+/// byte unchanged. A full rollout rewrite is still available as an explicit
+/// recovery operation through `SessionSyncOptions::full_rollout_rewrite`.
 pub fn unify_sessions(
     target_provider: &str,
     target_model: &str,
@@ -46,38 +47,20 @@ pub fn unify_sessions(
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
     let backup_dir = codex_dir().join(format!(".sessions_backup_{}", timestamp));
 
-    if options.rewrite_rollouts {
-        println!("  Warning: rewriting rollout JSONL metadata; originals will be backed up first.");
-        let sessions_dir = codex_dir().join("sessions");
-        if sessions_dir.exists() {
-            fs::create_dir_all(&backup_dir)?;
-
-            for entry in WalkDir::new(&sessions_dir)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let fname = path.file_name().unwrap_or_default().to_string_lossy();
-                if !fname.starts_with("rollout-") || !fname.ends_with(".jsonl") {
-                    continue;
-                }
-
-                match process_session_file(path, target_provider, target_model, &backup_dir) {
-                    Ok(true) => summary.rollouts_modified += 1,
-                    Ok(false) => summary.rollouts_skipped += 1,
-                    Err(e) => {
-                        eprintln!("  Error processing {}: {}", path.display(), e);
-                        summary.rollout_errors += 1;
-                    }
-                }
-            }
-        }
+    if options.full_rollout_rewrite {
+        println!(
+            "  Warning: full rollout JSONL rewrite enabled; originals will be backed up first."
+        );
     } else {
-        println!("  Rollout JSONL: left unchanged (SQLite index sync only).");
+        println!("  Rollout JSONL: syncing metadata rows only; event/tool rows stay unchanged.");
     }
+    sync_rollout_files(
+        target_provider,
+        target_model,
+        &backup_dir,
+        options.full_rollout_rewrite,
+        &mut summary,
+    );
 
     match update_sessions_db(target_provider, target_model, &backup_dir) {
         Ok(db_summary) => {
@@ -143,18 +126,78 @@ pub fn prune_session_backups(keep: usize) {
     }
 }
 
-/// Process a single session file: update every existing model_provider field,
-/// and every non-empty model field.
+/// Sync rollout files under both live and archived session roots.
+fn sync_rollout_files(
+    target_provider: &str,
+    target_model: &str,
+    backup_dir: &Path,
+    full_rewrite: bool,
+    summary: &mut SessionSyncSummary,
+) {
+    for root_name in ["sessions", "archived_sessions"] {
+        let root = codex_dir().join(root_name);
+        if !root.exists() {
+            continue;
+        }
+
+        for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let fname = path.file_name().unwrap_or_default().to_string_lossy();
+            if !fname.starts_with("rollout-") || !fname.ends_with(".jsonl") {
+                continue;
+            }
+
+            let result = if full_rewrite {
+                process_session_file(path, target_provider, target_model, backup_dir)
+            } else {
+                process_session_metadata_file(path, target_provider, target_model, backup_dir)
+            };
+
+            match result {
+                Ok(ProcessSessionFileResult {
+                    modified: true,
+                    lines_updated,
+                }) => {
+                    summary.rollouts_modified += 1;
+                    summary.metadata_lines_updated += lines_updated;
+                }
+                Ok(ProcessSessionFileResult {
+                    modified: false, ..
+                }) => summary.rollouts_skipped += 1,
+                Err(e) => {
+                    eprintln!("  Error processing {}: {}", path.display(), e);
+                    summary.rollout_errors += 1;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProcessSessionFileResult {
+    modified: bool,
+    lines_updated: usize,
+}
+
+/// Process a single session file using the legacy full rewrite behavior.
+///
+/// This rewrites every parsed JSON line and is intentionally reserved for
+/// explicit recovery workflows. Normal switch/sync uses
+/// `process_session_metadata_file` so tool calls and command output rows remain
+/// byte-for-byte unchanged.
 fn process_session_file(
     path: &Path,
     target_provider: &str,
     target_model: &str,
-    backup_dir: &PathBuf,
-) -> Result<bool> {
+    backup_dir: &Path,
+) -> Result<ProcessSessionFileResult> {
     let content = fs::read_to_string(path)?;
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
-        return Ok(false);
+        return Ok(ProcessSessionFileResult::default());
     }
 
     let needs_update = lines.iter().any(|line| {
@@ -165,40 +208,105 @@ fn process_session_file(
     });
 
     if !needs_update {
-        return Ok(false);
+        return Ok(ProcessSessionFileResult::default());
     }
 
-    // Backup
-    let backup_path = backup_dir.join(path.file_name().unwrap());
-    fs::copy(path, &backup_path)?;
+    backup_session_file(path, backup_dir)?;
 
     let mut new_lines: Vec<String> = Vec::with_capacity(lines.len());
+    let mut lines_updated = 0usize;
     for line in lines.iter() {
         let mut d: serde_json::Value =
             serde_json::from_str(line).context("Failed to parse line")?;
+        let line_needs_update = payload_needs_update(&d, target_provider, target_model);
 
         if let Some(obj) = d.get_mut("payload").and_then(|p| p.as_object_mut()) {
+            if line_needs_update {
+                lines_updated += 1;
+            }
             update_payload(obj, target_provider, target_model);
         }
 
         new_lines.push(serde_json::to_string(&d)?);
     }
 
-    let new_content = new_lines.join("\n") + if content.ends_with('\n') { "\n" } else { "" };
+    write_session_content_preserving_mtime(path, &content, new_lines)?;
 
-    // Preserve original mtime so Codex session ordering is not disturbed
-    let original_mtime = fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .map(FileTime::from_system_time);
+    Ok(ProcessSessionFileResult {
+        modified: true,
+        lines_updated,
+    })
+}
 
-    fs::write(path, new_content)?;
-
-    if let Some(mtime) = original_mtime {
-        let _ = filetime::set_file_mtime(path, mtime);
+/// Process a single session file by rewriting only metadata JSONL rows.
+fn process_session_metadata_file(
+    path: &Path,
+    target_provider: &str,
+    target_model: &str,
+    backup_dir: &Path,
+) -> Result<ProcessSessionFileResult> {
+    let content = fs::read_to_string(path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return Ok(ProcessSessionFileResult::default());
     }
 
-    Ok(true)
+    let mut changed = false;
+    let mut lines_updated = 0usize;
+    let mut new_lines: Vec<String> = Vec::with_capacity(lines.len());
+
+    for line in lines {
+        let Some(updated) = rewrite_metadata_line(line, target_provider, target_model)? else {
+            new_lines.push(line.to_string());
+            continue;
+        };
+        changed = true;
+        lines_updated += 1;
+        new_lines.push(updated);
+    }
+
+    if !changed {
+        return Ok(ProcessSessionFileResult::default());
+    }
+
+    backup_session_file(path, backup_dir)?;
+    write_session_content_preserving_mtime(path, &content, new_lines)?;
+
+    Ok(ProcessSessionFileResult {
+        modified: true,
+        lines_updated,
+    })
+}
+
+fn rewrite_metadata_line(
+    line: &str,
+    target_provider: &str,
+    target_model: &str,
+) -> Result<Option<String>> {
+    if !line.contains("\"session_meta\"") && !line.contains("\"turn_context\"") {
+        return Ok(None);
+    }
+
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Ok(None);
+    };
+    let Some(record_type) = value.get("type").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    if record_type != "session_meta" && record_type != "turn_context" {
+        return Ok(None);
+    }
+
+    let needs_update = payload_needs_update(&value, target_provider, target_model);
+    if !needs_update {
+        return Ok(None);
+    }
+
+    if let Some(obj) = value.get_mut("payload").and_then(|p| p.as_object_mut()) {
+        update_payload(obj, target_provider, target_model);
+    }
+
+    Ok(Some(serde_json::to_string(&value)?))
 }
 
 fn payload_needs_update(
@@ -300,6 +408,50 @@ fn update_payload(
             );
         }
     }
+}
+
+fn backup_session_file(path: &Path, backup_dir: &Path) -> Result<()> {
+    let base = codex_dir();
+    let relative = path
+        .strip_prefix(&base)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| {
+            path.file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("rollout.jsonl"))
+        });
+    let backup_path = backup_dir.join(relative);
+    if let Some(parent) = backup_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(path, &backup_path)?;
+    Ok(())
+}
+
+fn write_session_content_preserving_mtime(
+    path: &Path,
+    original_content: &str,
+    new_lines: Vec<String>,
+) -> Result<()> {
+    let new_content = new_lines.join("\n")
+        + if original_content.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+
+    let original_mtime = fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(FileTime::from_system_time);
+
+    fs::write(path, new_content)?;
+
+    if let Some(mtime) = original_mtime {
+        let _ = filetime::set_file_mtime(path, mtime);
+    }
+
+    Ok(())
 }
 
 /// Update the SQLite database threads table.
@@ -474,7 +626,7 @@ mod tests {
         .unwrap();
 
         let changed = process_session_file(&path, "newapi", "gpt-5.5", &backup_dir).unwrap();
-        assert!(changed);
+        assert!(changed.modified);
 
         let content = fs::read_to_string(&path).unwrap();
         let rows: Vec<Value> = content
@@ -509,7 +661,7 @@ mod tests {
         .unwrap();
 
         let changed = process_session_file(&path, "switch", "gpt-5.5", &backup_dir).unwrap();
-        assert!(changed);
+        assert!(changed.modified);
 
         let content = fs::read_to_string(&path).unwrap();
         let rows: Vec<Value> = content

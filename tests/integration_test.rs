@@ -66,17 +66,34 @@ fn create_threads_fixture(conn: &Connection, provider: &str, model: Option<&str>
             id TEXT PRIMARY KEY,
             model_provider TEXT,
             model TEXT,
-            rollout_path TEXT
+            rollout_path TEXT,
+            cwd TEXT,
+            archived INTEGER
         )",
         [],
     )
     .expect("create threads table");
     conn.execute(
-        "INSERT INTO threads (id, model_provider, model, rollout_path)
-         VALUES (?1, ?2, ?3, ?4)",
-        params!["thread-1", provider, model, "sessions/rollout-test.jsonl"],
+        "INSERT INTO threads (id, model_provider, model, rollout_path, cwd, archived)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            "thread-1",
+            provider,
+            model,
+            "sessions/rollout-test.jsonl",
+            "/tmp/example-project",
+            0
+        ],
     )
     .expect("insert thread row");
+}
+
+fn parse_jsonl(path: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(path)
+        .expect("read jsonl")
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 fn read_thread_model(path: &Path) -> (Option<String>, Option<String>) {
@@ -244,19 +261,30 @@ fn test_switch_nonexistent_profile() {
 }
 
 #[test]
-fn test_switch_preserves_rollout_jsonl_by_default_and_updates_db() {
-    let home = temp_home("switch_rollout_readonly");
+fn test_switch_syncs_rollout_metadata_only_by_default_and_updates_db() {
+    let home = temp_home("switch_rollout_metadata_only");
     write_profile(&home, "target");
     let codex = home.join(".codex");
     let sessions = codex.join("sessions");
     fs::create_dir_all(&sessions).expect("create sessions dir");
     let rollout = sessions.join("rollout-test.jsonl");
-    let original_rollout = concat!(
-        "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}\n",
-        "not json but should remain untouched\n",
-        "{\"type\":\"function_call_output\",\"payload\":{\"output\":\"tool output stays\"}}\n"
-    );
-    fs::write(&rollout, original_rollout).expect("write rollout");
+    let event_line = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"exec_command_output\",\"stdout\":\"tool output stays\",\"collaboration_mode\":{\"settings\":{\"model\":\"gpt-5.4\"}}}}";
+    fs::write(
+        &rollout,
+        format!(
+            "{}\n{}\nnot json but should remain untouched\n{}\n",
+            "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":null}}",
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.4\",\"collaboration_mode\":{\"settings\":{\"model\":\"gpt-5.4\",\"reasoning_effort\":\"high\"}}}}",
+            event_line
+        ),
+    )
+    .expect("write rollout");
+
+    let original_lines: Vec<String> = fs::read_to_string(&rollout)
+        .unwrap()
+        .lines()
+        .map(ToString::to_string)
+        .collect();
 
     let db_path = codex.join("state_5.sqlite");
     create_state_db(&db_path, "old", Some("gpt-5.4"));
@@ -268,7 +296,20 @@ fn test_switch_preserves_rollout_jsonl_by_default_and_updates_db() {
         .expect("Failed to run ucp switch");
 
     assert_success(&output);
-    assert_eq!(fs::read_to_string(&rollout).unwrap(), original_rollout);
+    let rows = parse_jsonl(&rollout);
+    assert_eq!(rows[0]["payload"]["model_provider"], "target");
+    assert_eq!(rows[1]["payload"]["model"], "gpt-5.5");
+    assert_eq!(
+        rows[1]["payload"]["collaboration_mode"]["settings"]["model"],
+        "gpt-5.5"
+    );
+    let new_lines: Vec<String> = fs::read_to_string(&rollout)
+        .unwrap()
+        .lines()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(new_lines[2], original_lines[2]);
+    assert_eq!(new_lines[3], original_lines[3]);
     assert_eq!(
         read_thread_model(&db_path),
         (Some("target".to_string()), Some("gpt-5.5".to_string()))
@@ -278,18 +319,18 @@ fn test_switch_preserves_rollout_jsonl_by_default_and_updates_db() {
     assert!(backups
         .iter()
         .any(|dir| dir.join("state_5.sqlite").exists()));
-    assert!(!backups
+    assert!(backups
         .iter()
-        .any(|dir| dir.join("rollout-test.jsonl").exists()));
+        .any(|dir| dir.join("sessions").join("rollout-test.jsonl").exists()));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Rollout JSONL: left unchanged"));
+    assert!(stdout.contains("metadata rows only"));
 
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn test_sync_updates_legacy_and_new_sqlite_paths_without_rollout_rewrite() {
-    let home = temp_home("sync_dual_db_readonly");
+fn test_sync_updates_dual_sqlite_paths_and_live_archived_rollout_metadata() {
+    let home = temp_home("sync_dual_db_metadata");
     write_profile(&home, "target");
     let codex = home.join(".codex");
     fs::write(
@@ -301,9 +342,19 @@ fn test_sync_updates_legacy_and_new_sqlite_paths_without_rollout_rewrite() {
     let sessions = codex.join("sessions");
     fs::create_dir_all(&sessions).expect("create sessions dir");
     let rollout = sessions.join("rollout-test.jsonl");
-    let original_rollout =
-        "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}\n";
-    fs::write(&rollout, original_rollout).expect("write rollout");
+    fs::write(
+        &rollout,
+        "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}\n",
+    )
+    .expect("write rollout");
+    let archived = codex.join("archived_sessions");
+    fs::create_dir_all(&archived).expect("create archived sessions dir");
+    let archived_rollout = archived.join("rollout-archived.jsonl");
+    fs::write(
+        &archived_rollout,
+        "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}\n",
+    )
+    .expect("write archived rollout");
 
     let legacy_db = codex.join("state_5.sqlite");
     let new_db = codex.join("sqlite").join("state_5.sqlite");
@@ -317,7 +368,14 @@ fn test_sync_updates_legacy_and_new_sqlite_paths_without_rollout_rewrite() {
         .expect("Failed to run ucp sync");
 
     assert_success(&output);
-    assert_eq!(fs::read_to_string(&rollout).unwrap(), original_rollout);
+    assert_eq!(
+        parse_jsonl(&rollout)[0]["payload"]["model_provider"],
+        "target"
+    );
+    assert_eq!(
+        parse_jsonl(&archived_rollout)[0]["payload"]["model_provider"],
+        "target"
+    );
     assert_eq!(
         read_thread_model(&legacy_db),
         (Some("target".to_string()), Some("gpt-5.5".to_string()))
@@ -334,6 +392,13 @@ fn test_sync_updates_legacy_and_new_sqlite_paths_without_rollout_rewrite() {
     assert!(backups
         .iter()
         .any(|dir| dir.join("sqlite").join("state_5.sqlite").exists()));
+    assert!(backups
+        .iter()
+        .any(|dir| dir.join("sessions").join("rollout-test.jsonl").exists()));
+    assert!(backups.iter().any(|dir| dir
+        .join("archived_sessions")
+        .join("rollout-archived.jsonl")
+        .exists()));
 
     let _ = fs::remove_dir_all(&home);
 }
@@ -356,7 +421,8 @@ fn test_sync_rewrites_rollout_jsonl_only_with_explicit_flag() {
         &rollout,
         concat!(
             "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}\n",
-            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.4\",\"collaboration_mode\":{\"settings\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}}}\n"
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.4\",\"collaboration_mode\":{\"settings\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"collaboration_mode\":{\"settings\":{\"model\":\"gpt-5.4\"}}}}\n"
         ),
     )
     .expect("write rollout");
@@ -372,11 +438,12 @@ fn test_sync_rewrites_rollout_jsonl_only_with_explicit_flag() {
     assert!(rewritten.contains("\"model_provider\":\"target\""));
     assert!(rewritten.contains("\"model\":\"gpt-5.5\""));
     assert!(!rewritten.contains("\"model_provider\":\"old\""));
+    assert!(!rewritten.contains("\"model\":\"gpt-5.4\""));
 
     let backups = session_backup_dirs(&home);
     assert!(backups
         .iter()
-        .any(|dir| dir.join("rollout-test.jsonl").exists()));
+        .any(|dir| dir.join("sessions").join("rollout-test.jsonl").exists()));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--rewrite-rollouts is enabled"));
 
