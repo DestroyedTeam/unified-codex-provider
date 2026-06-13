@@ -54,7 +54,7 @@ pub fn clear_state() -> Result<()> {
 /// Before switching away, captures the current state:
 /// 1. Updates common.toml from current config.toml (preserves new projects, plugins, etc.)
 /// 2. Updates the current provider's auth snapshot (preserves refreshed tokens)
-pub fn switch_provider(profile_name: &str) -> Result<()> {
+pub fn switch_provider(profile_name: &str, rewrite_rollouts: bool) -> Result<()> {
     let profile = provider::load_profile_by_name(profile_name)
         .with_context(|| format!("Cannot load profile '{}'", profile_name))?;
 
@@ -74,13 +74,20 @@ pub fn switch_provider(profile_name: &str) -> Result<()> {
     println!("  Writing auth.json...");
     auth::write_auth(&profile, profile_name)?;
 
-    // 3. Unify sessions
-    println!("  Unifying sessions...");
-    let (modified, skipped, errors) =
-        sessions::unify_sessions(&profile.provider.model_provider, &profile.provider.model)?;
+    // 3. Unify session visibility. Rollout JSONL is append-only by default.
+    println!("  Syncing session visibility...");
+    let session_summary = sessions::unify_sessions(
+        &profile.provider.model_provider,
+        &profile.provider.model,
+        sessions::SessionSyncOptions { rewrite_rollouts },
+    )?;
     println!(
-        "  Sessions: {} modified, {} skipped, {} errors",
-        modified, skipped, errors
+        "  Rollouts: {} modified, {} skipped, {} errors; DB: {} rows, {} errors",
+        session_summary.rollouts_modified,
+        session_summary.rollouts_skipped,
+        session_summary.rollout_errors,
+        session_summary.db_records_updated,
+        session_summary.db_errors
     );
 
     // 4. Save state
@@ -124,10 +131,14 @@ fn capture_current_state() -> Result<()> {
 /// - If provider hasn't changed (same model_provider as last sync):
 ///   → auth.json changed = token refresh → UPDATE the snapshot (not overwrite auth)
 ///   → config.toml changed = Codex added projects/plugins → UPDATE common.toml
-///   → stale sessions from an older failed sync → RECONCILE session metadata
+///   → stale session database rows from an older failed sync → RECONCILE indexes
 /// - If provider changed (different model_provider):
-///   → Full switch detected externally → unify sessions to match
+///   → Full switch detected externally → update session visibility indexes to match
 pub fn auto_sync() -> Result<()> {
+    auto_sync_with_options(false)
+}
+
+pub fn auto_sync_with_options(rewrite_rollouts: bool) -> Result<()> {
     let current_provider = config::read_current_model_provider()?;
     let current_provider = match current_provider {
         Some(p) => p,
@@ -161,9 +172,8 @@ pub fn auto_sync() -> Result<()> {
             fs::write(config::common_toml_path(), &new_common)?;
         }
 
-        // Reconcile sessions even when provider is unchanged. This makes
-        // `ucp sync --auto` self-heal if an older sync missed some session
-        // lines or the SQLite model column.
+        // Reconcile the SQLite session index even when provider is unchanged.
+        // Rollout JSONL remains append-only unless explicitly requested.
         let matched_profile = provider::load_profile_by_name(profile_name)
             .ok()
             .or_else(|| {
@@ -173,10 +183,22 @@ pub fn auto_sync() -> Result<()> {
                     .map(|(_, profile)| profile)
             });
         if let Some(profile) = matched_profile {
-            let (modified, _skipped, errors) =
-                sessions::unify_sessions(&current_provider, &profile.provider.model)?;
-            if modified > 0 || errors > 0 {
-                println!("  Sessions: {} modified, {} errors", modified, errors);
+            let summary = sessions::unify_sessions(
+                &current_provider,
+                &profile.provider.model,
+                sessions::SessionSyncOptions { rewrite_rollouts },
+            )?;
+            if summary.rollouts_modified > 0
+                || summary.rollout_errors > 0
+                || summary.db_records_updated > 0
+                || summary.db_errors > 0
+            {
+                println!(
+                    "  Sessions: {} rollout(s) modified, {} DB row(s), {} error(s)",
+                    summary.rollouts_modified,
+                    summary.db_records_updated,
+                    summary.rollout_errors + summary.db_errors
+                );
             }
         } else {
             println!(
@@ -228,12 +250,25 @@ pub fn auto_sync() -> Result<()> {
         auth::save_auth_snapshot_from(&auth_path, &profile_name)?;
     }
 
-    // Unify sessions to the new provider
-    println!("  Unifying sessions to '{}'...", profile_name);
+    // Unify session visibility to the new provider.
+    println!("  Syncing session visibility to '{}'...", profile_name);
     let target_model = &matched_profile.provider.model;
-    let (modified, _skipped, errors) = sessions::unify_sessions(&current_provider, target_model)?;
-    if modified > 0 || errors > 0 {
-        println!("  Sessions: {} modified, {} errors", modified, errors);
+    let summary = sessions::unify_sessions(
+        &current_provider,
+        target_model,
+        sessions::SessionSyncOptions { rewrite_rollouts },
+    )?;
+    if summary.rollouts_modified > 0
+        || summary.rollout_errors > 0
+        || summary.db_records_updated > 0
+        || summary.db_errors > 0
+    {
+        println!(
+            "  Sessions: {} rollout(s) modified, {} DB row(s), {} error(s)",
+            summary.rollouts_modified,
+            summary.db_records_updated,
+            summary.rollout_errors + summary.db_errors
+        );
     }
 
     save_state(&current_provider, &profile_name)?;
@@ -242,9 +277,9 @@ pub fn auto_sync() -> Result<()> {
 }
 
 /// Manual sync: force full sync based on current config.toml
-pub fn manual_sync() -> Result<()> {
+pub fn manual_sync(rewrite_rollouts: bool) -> Result<()> {
     println!("Running manual sync...");
-    auto_sync()
+    auto_sync_with_options(rewrite_rollouts)
 }
 
 /// Show current status

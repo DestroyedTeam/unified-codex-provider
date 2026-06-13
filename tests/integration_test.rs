@@ -1,5 +1,6 @@
-use std::path::PathBuf;
-use std::process::Command;
+use rusqlite::{params, Connection};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
@@ -13,6 +14,15 @@ fn temp_home(label: &str) -> PathBuf {
         .expect("system clock before unix epoch")
         .as_nanos();
     env::temp_dir().join(format!("ucp_{}_{}_{}", label, std::process::id(), nanos))
+}
+
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn write_profile(home: &std::path::Path, name: &str) {
@@ -29,6 +39,79 @@ model = "gpt-5.5"
         ),
     )
     .expect("write profile");
+}
+
+fn create_state_db(path: &Path, provider: &str, model: Option<&str>) {
+    fs::create_dir_all(path.parent().expect("state db parent")).expect("create state db dir");
+    let conn = Connection::open(path).expect("open state db");
+    create_threads_fixture(&conn, provider, model);
+}
+
+fn create_state_db_with_wal(path: &Path, provider: &str, model: Option<&str>) -> Connection {
+    fs::create_dir_all(path.parent().expect("state db parent")).expect("create state db dir");
+    let conn = Connection::open(path).expect("open state db");
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .expect("enable WAL");
+    assert_eq!(mode.to_ascii_lowercase(), "wal");
+    create_threads_fixture(&conn, provider, model);
+    assert!(sqlite_sidecar_path(path, "-wal").exists());
+    assert!(sqlite_sidecar_path(path, "-shm").exists());
+    conn
+}
+
+fn create_threads_fixture(conn: &Connection, provider: &str, model: Option<&str>) {
+    conn.execute(
+        "CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            model_provider TEXT,
+            model TEXT,
+            rollout_path TEXT
+        )",
+        [],
+    )
+    .expect("create threads table");
+    conn.execute(
+        "INSERT INTO threads (id, model_provider, model, rollout_path)
+         VALUES (?1, ?2, ?3, ?4)",
+        params!["thread-1", provider, model, "sessions/rollout-test.jsonl"],
+    )
+    .expect("insert thread row");
+}
+
+fn read_thread_model(path: &Path) -> (Option<String>, Option<String>) {
+    let conn = Connection::open(path).expect("open state db");
+    conn.query_row(
+        "SELECT model_provider, model FROM threads WHERE id = 'thread-1'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .expect("read thread row")
+}
+
+fn session_backup_dirs(home: &Path) -> Vec<PathBuf> {
+    let codex = home.join(".codex");
+    let mut dirs: Vec<PathBuf> = fs::read_dir(&codex)
+        .unwrap_or_else(|_| panic!("read {}", codex.display()))
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.starts_with(".sessions_backup_"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut raw = db_path.as_os_str().to_os_string();
+    raw.push(suffix);
+    PathBuf::from(raw)
 }
 
 #[test]
@@ -158,6 +241,183 @@ fn test_switch_nonexistent_profile() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("not found") || stderr.contains("Cannot load"));
+}
+
+#[test]
+fn test_switch_preserves_rollout_jsonl_by_default_and_updates_db() {
+    let home = temp_home("switch_rollout_readonly");
+    write_profile(&home, "target");
+    let codex = home.join(".codex");
+    let sessions = codex.join("sessions");
+    fs::create_dir_all(&sessions).expect("create sessions dir");
+    let rollout = sessions.join("rollout-test.jsonl");
+    let original_rollout = concat!(
+        "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}\n",
+        "not json but should remain untouched\n",
+        "{\"type\":\"function_call_output\",\"payload\":{\"output\":\"tool output stays\"}}\n"
+    );
+    fs::write(&rollout, original_rollout).expect("write rollout");
+
+    let db_path = codex.join("state_5.sqlite");
+    create_state_db(&db_path, "old", Some("gpt-5.4"));
+
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .args(["switch", "target"])
+        .output()
+        .expect("Failed to run ucp switch");
+
+    assert_success(&output);
+    assert_eq!(fs::read_to_string(&rollout).unwrap(), original_rollout);
+    assert_eq!(
+        read_thread_model(&db_path),
+        (Some("target".to_string()), Some("gpt-5.5".to_string()))
+    );
+
+    let backups = session_backup_dirs(&home);
+    assert!(backups
+        .iter()
+        .any(|dir| dir.join("state_5.sqlite").exists()));
+    assert!(!backups
+        .iter()
+        .any(|dir| dir.join("rollout-test.jsonl").exists()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Rollout JSONL: left unchanged"));
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_sync_updates_legacy_and_new_sqlite_paths_without_rollout_rewrite() {
+    let home = temp_home("sync_dual_db_readonly");
+    write_profile(&home, "target");
+    let codex = home.join(".codex");
+    fs::write(
+        codex.join("config.toml"),
+        "model_provider = \"target\"\nmodel = \"gpt-5.5\"\n",
+    )
+    .expect("write config");
+
+    let sessions = codex.join("sessions");
+    fs::create_dir_all(&sessions).expect("create sessions dir");
+    let rollout = sessions.join("rollout-test.jsonl");
+    let original_rollout =
+        "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}\n";
+    fs::write(&rollout, original_rollout).expect("write rollout");
+
+    let legacy_db = codex.join("state_5.sqlite");
+    let new_db = codex.join("sqlite").join("state_5.sqlite");
+    create_state_db(&legacy_db, "old", Some("gpt-5.4"));
+    create_state_db(&new_db, "old", Some("gpt-5.4"));
+
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .arg("sync")
+        .output()
+        .expect("Failed to run ucp sync");
+
+    assert_success(&output);
+    assert_eq!(fs::read_to_string(&rollout).unwrap(), original_rollout);
+    assert_eq!(
+        read_thread_model(&legacy_db),
+        (Some("target".to_string()), Some("gpt-5.5".to_string()))
+    );
+    assert_eq!(
+        read_thread_model(&new_db),
+        (Some("target".to_string()), Some("gpt-5.5".to_string()))
+    );
+
+    let backups = session_backup_dirs(&home);
+    assert!(backups
+        .iter()
+        .any(|dir| dir.join("state_5.sqlite").exists()));
+    assert!(backups
+        .iter()
+        .any(|dir| dir.join("sqlite").join("state_5.sqlite").exists()));
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_sync_rewrites_rollout_jsonl_only_with_explicit_flag() {
+    let home = temp_home("sync_rewrite_rollouts");
+    write_profile(&home, "target");
+    let codex = home.join(".codex");
+    fs::write(
+        codex.join("config.toml"),
+        "model_provider = \"target\"\nmodel = \"gpt-5.5\"\n",
+    )
+    .expect("write config");
+
+    let sessions = codex.join("sessions");
+    fs::create_dir_all(&sessions).expect("create sessions dir");
+    let rollout = sessions.join("rollout-test.jsonl");
+    fs::write(
+        &rollout,
+        concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.4\",\"collaboration_mode\":{\"settings\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}}}\n"
+        ),
+    )
+    .expect("write rollout");
+
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .args(["sync", "--rewrite-rollouts"])
+        .output()
+        .expect("Failed to run ucp sync --rewrite-rollouts");
+
+    assert_success(&output);
+    let rewritten = fs::read_to_string(&rollout).unwrap();
+    assert!(rewritten.contains("\"model_provider\":\"target\""));
+    assert!(rewritten.contains("\"model\":\"gpt-5.5\""));
+    assert!(!rewritten.contains("\"model_provider\":\"old\""));
+
+    let backups = session_backup_dirs(&home);
+    assert!(backups
+        .iter()
+        .any(|dir| dir.join("rollout-test.jsonl").exists()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--rewrite-rollouts is enabled"));
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_sqlite_backup_includes_wal_shm_and_prunes_old_backups() {
+    let home = temp_home("sqlite_backup_prune");
+    write_profile(&home, "target");
+    let codex = home.join(".codex");
+    fs::write(
+        codex.join("config.toml"),
+        "model_provider = \"target\"\nmodel = \"gpt-5.5\"\n",
+    )
+    .expect("write config");
+
+    for day in 1..=4 {
+        fs::create_dir_all(codex.join(format!(".sessions_backup_2000010{day}_000000")))
+            .expect("create old backup dir");
+    }
+
+    let db_path = codex.join("state_5.sqlite");
+    let wal_conn = create_state_db_with_wal(&db_path, "old", Some("gpt-5.4"));
+
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .arg("sync")
+        .output()
+        .expect("Failed to run ucp sync");
+
+    assert_success(&output);
+    let backups = session_backup_dirs(&home);
+    assert!(backups.len() <= 3);
+    assert!(!codex.join(".sessions_backup_20000101_000000").exists());
+    assert!(backups.iter().any(|dir| dir.join("state_5.sqlite").exists()
+        && dir.join("state_5.sqlite-wal").exists()
+        && dir.join("state_5.sqlite-shm").exists()));
+
+    drop(wal_conn);
+    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]

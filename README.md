@@ -12,7 +12,8 @@ visibility.
 - Keep provider-specific profiles separate from shared Codex configuration.
 - Preserve full ChatGPT authentication snapshots, including refreshed tokens.
 - Switch between native OpenAI accounts, API-key providers, and proxies.
-- Reconcile session metadata so historical sessions remain visible.
+- Reconcile Codex session database indexes so historical sessions remain visible
+  without rewriting rollout JSONL logs by default.
 - Detect duplicate ChatGPT auth snapshots that may cause
   `refresh_token_reused` failures.
 - Generate dynamic shell completion for Bash, Zsh, and Fish.
@@ -81,6 +82,11 @@ ucp switch openai_work
 ucp status
 ucp remove old-profile
 ```
+
+`ucp switch` and `ucp sync` leave historical `rollout-*.jsonl` files unchanged
+by default. If you are intentionally repairing old rollout metadata, pass
+`--rewrite-rollouts`; UCP will back up matching rollout files and SQLite state
+files before rewriting.
 
 ## Shell Completion
 

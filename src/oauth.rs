@@ -70,7 +70,7 @@ pub fn login_and_save(options: LoginOptions) -> Result<SavedLogin> {
 
     let snapshot_path = auth::auth_snapshot_path(&profile_name);
     if options.switch_after {
-        crate::sync::switch_provider(&profile_name)?;
+        crate::sync::switch_provider(&profile_name, false)?;
     }
 
     Ok(SavedLogin {
