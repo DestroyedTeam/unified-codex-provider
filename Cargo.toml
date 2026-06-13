@@ -1,6 +1,6 @@
 [package]
 name = "unified-codex-provider"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Unified provider switching and config sync for Codex"
 license = "MIT"
