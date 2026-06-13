@@ -250,11 +250,38 @@ fn update_payload(
 
 /// Update the SQLite database threads table
 fn update_sessions_db(target_provider: &str, target_model: &str) -> Result<usize> {
-    let db_path = codex_dir().join("state_5.sqlite");
-    if !db_path.exists() {
-        return Ok(0);
+    // Codex may store its state DB at either legacy `~/.codex/state_5.sqlite`
+    // or the newer `~/.codex/sqlite/state_5.sqlite`. Update all that exist.
+    let base = codex_dir();
+    let candidates = [
+        base.join("state_5.sqlite"),
+        base.join("sqlite").join("state_5.sqlite"),
+    ];
+
+    let mut total_updated = 0usize;
+    for db_path in &candidates {
+        if !db_path.exists() {
+            continue;
+        }
+        match update_single_db(db_path, target_provider, target_model) {
+            Ok(n) => total_updated += n,
+            Err(e) => {
+                eprintln!("  Warning: failed to update {}: {}", db_path.display(), e);
+            }
+        }
     }
-    let conn = rusqlite::Connection::open(&db_path).context("Failed to open state_5.sqlite")?;
+
+    Ok(total_updated)
+}
+
+/// Update a single SQLite state database.
+fn update_single_db(
+    db_path: &std::path::Path,
+    target_provider: &str,
+    target_model: &str,
+) -> Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)
+        .with_context(|| format!("Failed to open {}", db_path.display()))?;
     let table_exists: bool = conn
         .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'")?
         .exists([])?;
