@@ -65,3 +65,57 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --notes "See README.md for installation and setup instructions."
+
+  update-tap:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse version and checksums
+        id: meta
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # Download checksums from the release we just created
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            -p "checksums.txt" -O checksums.txt
+
+          arm64_sha=$(grep "aarch64-apple-darwin" checksums.txt | awk '{print $1}')
+          x86_sha=$(grep "x86_64-apple-darwin" checksums.txt | awk '{print $1}')
+          echo "arm64_sha=$arm64_sha" >> "$GITHUB_OUTPUT"
+          echo "x86_sha=$x86_sha" >> "$GITHUB_OUTPUT"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew tap formula
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          arm64_sha="${{ steps.meta.outputs.arm64_sha }}"
+          x86_sha="${{ steps.meta.outputs.x86_sha }}"
+          repo_owner="${GITHUB_REPOSITORY_OWNER}"
+
+          # Clone the tap repo
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${repo_owner}/homebrew-tap.git" tap
+          cd tap
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Update formula URLs and sha256
+          formula="Formula/ucp.rb"
+          sed -i "s|releases/download/v[^/]*/ucp-[^-]*-|releases/download/v${version}/ucp-${version}-|g" "$formula"
+          sed -i "/aarch64-apple-darwin/{n;s/sha256 \"[a-f0-9]*\"/sha256 \"${arm64_sha}\"/}" "$formula"
+          sed -i "/x86_64-apple-darwin/{n;s/sha256 \"[a-f0-9]*\"/sha256 \"${x86_sha}\"/}" "$formula"
+
+          # Verify the edit looks right
+          grep -A1 "aarch64" "$formula"
+          grep -A1 "x86_64" "$formula"
+
+          # Commit and push
+          git add "$formula"
+          git commit -m "feat: update ucp formula to v${version}" || echo "No changes to commit"
+          git push origin main
