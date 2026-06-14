@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod history;
 mod migrate;
 mod oauth;
 mod provider;

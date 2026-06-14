@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::config::codex_dir;
+use crate::history;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionSyncOptions {
@@ -21,6 +22,10 @@ pub struct SessionSyncSummary {
     pub db_records_updated: usize,
     pub db_backup_files: usize,
     pub db_errors: usize,
+    pub history_rollouts_scanned: usize,
+    pub history_tool_calls_indexed: usize,
+    pub history_command_executions_indexed: usize,
+    pub history_errors: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -86,6 +91,25 @@ pub fn unify_sessions(
             summary.db_backup_files,
             backup_dir.display()
         );
+    }
+
+    match history::refresh_history_index() {
+        Ok(history_summary) => {
+            summary.history_rollouts_scanned = history_summary.rollouts_scanned;
+            summary.history_tool_calls_indexed = history_summary.tool_calls_indexed;
+            summary.history_command_executions_indexed = history_summary.command_executions_indexed;
+            summary.history_errors = history_summary.errors;
+            println!(
+                "  History index: {} rollout(s), {} tool call(s), {} command execution(s)",
+                summary.history_rollouts_scanned,
+                summary.history_tool_calls_indexed,
+                summary.history_command_executions_indexed
+            );
+        }
+        Err(e) => {
+            eprintln!("  Warning: failed to refresh history index: {}", e);
+            summary.history_errors += 1;
+        }
     }
 
     if summary.rollouts_modified == 0 && summary.db_backup_files == 0 {

@@ -329,6 +329,81 @@ fn test_switch_syncs_rollout_metadata_only_by_default_and_updates_db() {
 }
 
 #[test]
+fn test_switch_rebuilds_history_index_by_default_without_printing_outputs() {
+    let home = temp_home("switch_history_index");
+    write_profile(&home, "target");
+    let codex = home.join(".codex");
+    let sessions = codex.join("sessions").join("2026").join("06").join("14");
+    let archived = codex.join("archived_sessions");
+    fs::create_dir_all(&sessions).expect("create sessions dir");
+    fs::create_dir_all(&archived).expect("create archived sessions dir");
+
+    let hidden_output = "captured output stays in the index, not stdout";
+    let live_rollout = sessions.join("rollout-2026-06-14T01-02-03-thread-live.jsonl");
+    fs::write(
+        &live_rollout,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            "{\"timestamp\":\"2026-06-14T01:02:03Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-live\",\"model_provider\":\"old\",\"type\":\"session_meta\"}}",
+            "{\"timestamp\":\"2026-06-14T01:02:04Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call_exec\",\"arguments\":\"{\\\"cmd\\\":\\\"echo ok\\\",\\\"workdir\\\":\\\"/tmp/project\\\"}\"}}",
+            format!(
+                "{{\"timestamp\":\"2026-06-14T01:02:05Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call_exec\",\"output\":\"{}\"}}}}",
+                hidden_output
+            ),
+            "{\"timestamp\":\"2026-06-14T01:02:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"apply_patch\",\"call_id\":\"call_patch\",\"input\":\"*** Begin Patch\"}}"
+        ),
+    )
+    .expect("write live rollout");
+
+    fs::write(
+        archived.join("rollout-2026-06-13T01-02-03-thread-archived.jsonl"),
+        concat!(
+            "{\"timestamp\":\"2026-06-13T01:02:04Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"exec_command_end\",\"call_id\":\"call_old\",\"command\":[\"/bin/zsh\",\"-lc\",\"printf old\"],\"cwd\":\"/tmp/old\",\"aggregated_output\":\"old output\",\"exit_code\":0,\"duration\":{\"secs\":1,\"nanos\":500000000},\"status\":\"completed\"}}\n",
+            "not json\n"
+        ),
+    )
+    .expect("write archived rollout");
+
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .args(["switch", "target"])
+        .output()
+        .expect("Failed to run ucp switch");
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("History index: 2 rollout(s), 2 tool call(s), 2 command execution(s)"));
+    assert!(!stdout.contains(hidden_output));
+
+    let index_dir = codex.join(".ucp_history");
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(index_dir.join("summary.json")).unwrap())
+            .expect("parse history summary");
+    assert_eq!(summary["rollouts_scanned"], 2);
+    assert_eq!(summary["live_rollouts"], 1);
+    assert_eq!(summary["archived_rollouts"], 1);
+    assert_eq!(summary["tool_calls_indexed"], 2);
+    assert_eq!(summary["command_executions_indexed"], 2);
+
+    let tool_calls = parse_jsonl(&index_dir.join("tool_calls.jsonl"));
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0]["thread_id"], "thread-live");
+    assert_eq!(tool_calls[0]["command"], "echo ok");
+    assert_eq!(tool_calls[1]["tool_name"], "apply_patch");
+
+    let commands = parse_jsonl(&index_dir.join("command_executions.jsonl"));
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0]["command"], "echo ok");
+    assert_eq!(commands[0]["cwd"], "/tmp/project");
+    assert_eq!(commands[0]["output_preview"], hidden_output);
+    assert_eq!(commands[1]["command"], "printf old");
+    assert_eq!(commands[1]["exit_code"], 0);
+    assert_eq!(commands[1]["duration_ms"], 1500);
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn test_sync_updates_dual_sqlite_paths_and_live_archived_rollout_metadata() {
     let home = temp_home("sync_dual_db_metadata");
     write_profile(&home, "target");

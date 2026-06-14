@@ -15,6 +15,9 @@ visibility.
 - Reconcile Codex session metadata and database indexes so historical sessions
   remain visible across provider switches without touching tool call/output
   rows.
+- Build a local read-only history audit index from raw rollout JSONL on every
+  switch/sync, so command executions and tool calls remain inspectable even if
+  Codex Desktop history replay omits them.
 - Detect duplicate ChatGPT auth snapshots that may cause
   `refresh_token_reused` failures.
 - Generate dynamic shell completion for Bash, Zsh, and Fish.
@@ -90,6 +93,14 @@ outputs, assistant messages, and other event rows are left byte-for-byte
 unchanged. If you are intentionally repairing an old corrupted rollout and want
 the legacy full-file rewrite behavior, pass `--rewrite-rollouts`; UCP will back
 up matching rollout files and SQLite state files first.
+
+Every switch/sync also refreshes `~/.codex/.ucp_history/` from the raw rollout
+files under both `sessions/` and `archived_sessions/`. The generated
+`tool_calls.jsonl`, `command_executions.jsonl`, and `summary.json` files are a
+read-only audit index: they list recovered tool calls, command/cwd/exit status,
+rollout path, and source line references without rewriting the original
+rollout history. Command output is stored only as a bounded preview in the
+index and is not printed by default during switch/sync.
 
 ## Shell Completion
 
