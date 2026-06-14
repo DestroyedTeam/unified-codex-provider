@@ -343,14 +343,17 @@ fn test_switch_rebuilds_history_index_by_default_without_printing_outputs() {
     fs::write(
         &live_rollout,
         format!(
-            "{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             "{\"timestamp\":\"2026-06-14T01:02:03Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-live\",\"model_provider\":\"old\",\"type\":\"session_meta\"}}",
             "{\"timestamp\":\"2026-06-14T01:02:04Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call_exec\",\"arguments\":\"{\\\"cmd\\\":\\\"echo ok\\\",\\\"workdir\\\":\\\"/tmp/project\\\"}\"}}",
             format!(
                 "{{\"timestamp\":\"2026-06-14T01:02:05Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call_exec\",\"output\":\"{}\"}}}}",
                 hidden_output
             ),
-            "{\"timestamp\":\"2026-06-14T01:02:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"apply_patch\",\"call_id\":\"call_patch\",\"input\":\"*** Begin Patch\"}}"
+            "{\"timestamp\":\"2026-06-14T01:02:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"apply_patch\",\"call_id\":\"call_patch\",\"input\":\"*** Begin Patch\"}}",
+            "{\"timestamp\":\"2026-06-14T01:02:07Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"mcp_tool_call_end\",\"call_id\":\"call_mcp\",\"invocation\":{\"server\":\"codex_app\",\"tool\":\"read_thread_terminal\",\"arguments\":{\"limit\":10}},\"result\":{\"Ok\":\"terminal output\"}}}",
+            "{\"timestamp\":\"2026-06-14T01:02:08Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"dynamic_tool_call_request\",\"callId\":\"call_dynamic\",\"namespace\":\"codex_app\",\"tool\":\"load_workspace_dependencies\",\"arguments\":{\"include\":\"runtime\"}}}",
+            "{\"timestamp\":\"2026-06-14T01:02:09Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"dynamic_tool_call_response\",\"call_id\":\"call_dynamic\",\"tool\":\"load_workspace_dependencies\",\"success\":true,\"content_items\":[{\"text\":\"deps loaded\"}]}}"
         ),
     )
     .expect("write live rollout");
@@ -372,7 +375,7 @@ fn test_switch_rebuilds_history_index_by_default_without_printing_outputs() {
 
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("History index: 2 rollout(s), 2 tool call(s), 2 command execution(s)"));
+    assert!(stdout.contains("History index: 2 rollout(s), 4 tool call(s), 2 command execution(s)"));
     assert!(!stdout.contains(hidden_output));
 
     let index_dir = codex.join(".ucp_history");
@@ -382,14 +385,23 @@ fn test_switch_rebuilds_history_index_by_default_without_printing_outputs() {
     assert_eq!(summary["rollouts_scanned"], 2);
     assert_eq!(summary["live_rollouts"], 1);
     assert_eq!(summary["archived_rollouts"], 1);
-    assert_eq!(summary["tool_calls_indexed"], 2);
+    assert_eq!(summary["tool_calls_indexed"], 4);
     assert_eq!(summary["command_executions_indexed"], 2);
 
     let tool_calls = parse_jsonl(&index_dir.join("tool_calls.jsonl"));
-    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls.len(), 4);
     assert_eq!(tool_calls[0]["thread_id"], "thread-live");
     assert_eq!(tool_calls[0]["command"], "echo ok");
     assert_eq!(tool_calls[1]["tool_name"], "apply_patch");
+    assert!(tool_calls
+        .iter()
+        .any(|call| call["tool_name"] == "codex_app.read_thread_terminal"
+            && call["status"] == "completed"));
+    assert!(tool_calls.iter().any(|call| call["tool_name"]
+        == "codex_app.load_workspace_dependencies"
+        && call["output_preview"]
+            .as_str()
+            .is_some_and(|preview| preview.contains("deps loaded"))));
 
     let commands = parse_jsonl(&index_dir.join("command_executions.jsonl"));
     assert_eq!(commands.len(), 2);

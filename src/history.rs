@@ -255,7 +255,7 @@ fn index_rollout_file(
             .map(ToString::to_string);
 
         match payload_type {
-            "function_call" | "custom_tool_call" => {
+            "function_call" | "custom_tool_call" | "tool_search_call" | "web_search_call" => {
                 let Some(call) = parse_tool_call(
                     payload,
                     payload_type,
@@ -272,7 +272,7 @@ fn index_rollout_file(
                 }
                 calls.push(call);
             }
-            "function_call_output" | "custom_tool_call_output" => {
+            "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
                 let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
                     continue;
                 };
@@ -281,15 +281,23 @@ fn index_rollout_file(
                 };
                 let output = payload
                     .get("output")
+                    .or_else(|| payload.get("tools"))
+                    .or_else(|| payload.get("execution"))
                     .map(|output| value_to_text(output))
                     .unwrap_or_default();
-                let (preview, bytes) = preview_text(&output, preview_chars);
-                let call = &mut calls[call_index];
-                call.output_line = Some(line_number);
-                call.output_preview = preview;
-                call.output_bytes = Some(bytes);
+                let status = payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                update_tool_call_output(
+                    &mut calls[call_index],
+                    line_number,
+                    &output,
+                    status,
+                    preview_chars,
+                );
             }
-            "exec_command_end" => {
+            "exec_command_end" | "exec_command_output" => {
                 let event = parse_exec_event(
                     payload,
                     &rollout_path,
@@ -303,6 +311,109 @@ fn index_rollout_file(
                 } else {
                     anonymous_events.push(event);
                 }
+            }
+            "mcp_tool_call_end" => {
+                let Some(call) = parse_mcp_tool_call_end(
+                    payload,
+                    &rollout_path,
+                    line_number,
+                    thread_id.clone(),
+                    timestamp,
+                    preview_chars,
+                ) else {
+                    continue;
+                };
+                if let Some(call_id) = call.call_id.clone() {
+                    calls_by_id.insert(call_id, calls.len());
+                }
+                calls.push(call);
+            }
+            "patch_apply_end" => {
+                let call = parse_patch_apply_end(
+                    payload,
+                    &rollout_path,
+                    line_number,
+                    thread_id.clone(),
+                    timestamp,
+                    preview_chars,
+                );
+                if let Some(call_id) = call.call_id.clone() {
+                    calls_by_id.insert(call_id, calls.len());
+                }
+                calls.push(call);
+            }
+            "dynamic_tool_call_request" => {
+                let Some(call) = parse_dynamic_tool_request(
+                    payload,
+                    &rollout_path,
+                    line_number,
+                    thread_id.clone(),
+                    timestamp,
+                    preview_chars,
+                ) else {
+                    continue;
+                };
+                if let Some(call_id) = call.call_id.clone() {
+                    calls_by_id.insert(call_id, calls.len());
+                }
+                calls.push(call);
+            }
+            "dynamic_tool_call_response" => {
+                let call_id = event_call_id(payload);
+                if let Some(call_index) = call_id.as_ref().and_then(|id| calls_by_id.get(id)) {
+                    let output = dynamic_response_output(payload);
+                    let status = dynamic_response_status(payload);
+                    update_tool_call_output(
+                        &mut calls[*call_index],
+                        line_number,
+                        &output,
+                        status,
+                        preview_chars,
+                    );
+                } else {
+                    let Some(call) = parse_dynamic_tool_response(
+                        payload,
+                        &rollout_path,
+                        line_number,
+                        thread_id.clone(),
+                        timestamp,
+                        preview_chars,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(call_id) = call.call_id.clone() {
+                        calls_by_id.insert(call_id, calls.len());
+                    }
+                    calls.push(call);
+                }
+            }
+            "view_image_tool_call" => {
+                let call = parse_view_image_tool_call(
+                    payload,
+                    &rollout_path,
+                    line_number,
+                    thread_id.clone(),
+                    timestamp,
+                    preview_chars,
+                );
+                if let Some(call_id) = call.call_id.clone() {
+                    calls_by_id.insert(call_id, calls.len());
+                }
+                calls.push(call);
+            }
+            "web_search_end" => {
+                let call = parse_web_search_end(
+                    payload,
+                    &rollout_path,
+                    line_number,
+                    thread_id.clone(),
+                    timestamp,
+                    preview_chars,
+                );
+                if let Some(call_id) = call.call_id.clone() {
+                    calls_by_id.insert(call_id, calls.len());
+                }
+                calls.push(call);
             }
             _ => {}
         }
@@ -347,7 +458,11 @@ fn parse_tool_call(
     timestamp: Option<String>,
     preview_chars: usize,
 ) -> Option<PartialToolCall> {
-    let tool_name = payload.get("name").and_then(Value::as_str)?.to_string();
+    let tool_name = match payload_type {
+        "tool_search_call" => "tool_search".to_string(),
+        "web_search_call" => "web_search".to_string(),
+        _ => payload.get("name").and_then(Value::as_str)?.to_string(),
+    };
     let call_id = payload
         .get("call_id")
         .and_then(Value::as_str)
@@ -356,10 +471,10 @@ fn parse_tool_call(
         .get("status")
         .and_then(Value::as_str)
         .map(ToString::to_string);
-    let argument_value = if payload_type == "function_call" {
-        payload.get("arguments")
-    } else {
-        payload.get("input")
+    let argument_value = match payload_type {
+        "function_call" | "tool_search_call" => payload.get("arguments"),
+        "web_search_call" => payload.get("action"),
+        _ => payload.get("input"),
     };
     let arguments_text = argument_value.map(value_to_text).unwrap_or_default();
     let (arguments_preview, arguments_bytes) = preview_text(&arguments_text, preview_chars);
@@ -380,11 +495,7 @@ fn parse_tool_call(
         rollout_path: rollout_path.to_string(),
         call_line: line_number,
         output_line: None,
-        tool_kind: if payload_type == "function_call" {
-            "function".to_string()
-        } else {
-            "custom".to_string()
-        },
+        tool_kind: response_tool_kind(payload_type).to_string(),
         tool_name,
         call_id,
         status,
@@ -395,6 +506,258 @@ fn parse_tool_call(
         output_preview: None,
         output_bytes: None,
     })
+}
+
+fn response_tool_kind(payload_type: &str) -> &'static str {
+    match payload_type {
+        "function_call" => "function",
+        "custom_tool_call" => "custom",
+        "tool_search_call" => "tool_search",
+        "web_search_call" => "web_search",
+        _ => "response",
+    }
+}
+
+fn update_tool_call_output(
+    call: &mut PartialToolCall,
+    line_number: usize,
+    output: &str,
+    status: Option<String>,
+    preview_chars: usize,
+) {
+    let (preview, bytes) = preview_text(output, preview_chars);
+    call.output_line = Some(line_number);
+    call.output_preview = preview;
+    call.output_bytes = Some(bytes);
+    if status.is_some() {
+        call.status = status;
+    }
+}
+
+fn parse_mcp_tool_call_end(
+    payload: &Value,
+    rollout_path: &str,
+    line_number: usize,
+    thread_id: Option<String>,
+    timestamp: Option<String>,
+    preview_chars: usize,
+) -> Option<PartialToolCall> {
+    let invocation = payload.get("invocation")?;
+    let tool = invocation
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or("mcp_tool");
+    let tool_name = invocation
+        .get("server")
+        .and_then(Value::as_str)
+        .filter(|server| !server.is_empty())
+        .map(|server| format!("{server}.{tool}"))
+        .unwrap_or_else(|| tool.to_string());
+    let arguments_text = invocation
+        .get("arguments")
+        .map(value_to_text)
+        .unwrap_or_default();
+    let (arguments_preview, arguments_bytes) = preview_text(&arguments_text, preview_chars);
+    let output_text = payload.get("result").map(value_to_text).unwrap_or_default();
+    let (output_preview, output_bytes) = preview_text(&output_text, preview_chars);
+
+    Some(PartialToolCall {
+        thread_id,
+        timestamp,
+        rollout_path: rollout_path.to_string(),
+        call_line: line_number,
+        output_line: if output_preview.is_some() {
+            Some(line_number)
+        } else {
+            None
+        },
+        tool_kind: "mcp".to_string(),
+        tool_name,
+        call_id: event_call_id(payload),
+        status: mcp_result_status(payload),
+        command: None,
+        cwd: None,
+        arguments_preview,
+        arguments_bytes: Some(arguments_bytes),
+        output_preview,
+        output_bytes: Some(output_bytes),
+    })
+}
+
+fn parse_patch_apply_end(
+    payload: &Value,
+    rollout_path: &str,
+    line_number: usize,
+    thread_id: Option<String>,
+    timestamp: Option<String>,
+    preview_chars: usize,
+) -> PartialToolCall {
+    let arguments_text = payload
+        .get("changes")
+        .map(value_to_text)
+        .unwrap_or_default();
+    let (arguments_preview, arguments_bytes) = preview_text(&arguments_text, preview_chars);
+    let output_text = event_output_text(payload);
+    let (output_preview, output_bytes) = preview_text(&output_text, preview_chars);
+
+    PartialToolCall {
+        thread_id,
+        timestamp,
+        rollout_path: rollout_path.to_string(),
+        call_line: line_number,
+        output_line: if output_preview.is_some() {
+            Some(line_number)
+        } else {
+            None
+        },
+        tool_kind: "event".to_string(),
+        tool_name: "apply_patch".to_string(),
+        call_id: event_call_id(payload),
+        status: payload
+            .get("status")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| bool_status(payload.get("success"))),
+        command: None,
+        cwd: None,
+        arguments_preview,
+        arguments_bytes: Some(arguments_bytes),
+        output_preview,
+        output_bytes: Some(output_bytes),
+    }
+}
+
+fn parse_dynamic_tool_request(
+    payload: &Value,
+    rollout_path: &str,
+    line_number: usize,
+    thread_id: Option<String>,
+    timestamp: Option<String>,
+    preview_chars: usize,
+) -> Option<PartialToolCall> {
+    let tool_name = event_tool_name(payload)?;
+    let arguments_text = payload
+        .get("arguments")
+        .map(value_to_text)
+        .unwrap_or_default();
+    let (arguments_preview, arguments_bytes) = preview_text(&arguments_text, preview_chars);
+
+    Some(PartialToolCall {
+        thread_id,
+        timestamp,
+        rollout_path: rollout_path.to_string(),
+        call_line: line_number,
+        output_line: None,
+        tool_kind: "dynamic".to_string(),
+        tool_name,
+        call_id: event_call_id(payload),
+        status: None,
+        command: None,
+        cwd: None,
+        arguments_preview,
+        arguments_bytes: Some(arguments_bytes),
+        output_preview: None,
+        output_bytes: None,
+    })
+}
+
+fn parse_dynamic_tool_response(
+    payload: &Value,
+    rollout_path: &str,
+    line_number: usize,
+    thread_id: Option<String>,
+    timestamp: Option<String>,
+    preview_chars: usize,
+) -> Option<PartialToolCall> {
+    let tool_name = event_tool_name(payload)?;
+    let output_text = dynamic_response_output(payload);
+    let (output_preview, output_bytes) = preview_text(&output_text, preview_chars);
+
+    Some(PartialToolCall {
+        thread_id,
+        timestamp,
+        rollout_path: rollout_path.to_string(),
+        call_line: line_number,
+        output_line: if output_preview.is_some() {
+            Some(line_number)
+        } else {
+            None
+        },
+        tool_kind: "dynamic".to_string(),
+        tool_name,
+        call_id: event_call_id(payload),
+        status: dynamic_response_status(payload),
+        command: None,
+        cwd: None,
+        arguments_preview: payload.get("arguments").map(value_to_text),
+        arguments_bytes: payload
+            .get("arguments")
+            .map(|value| value_to_text(value).len()),
+        output_preview,
+        output_bytes: Some(output_bytes),
+    })
+}
+
+fn parse_view_image_tool_call(
+    payload: &Value,
+    rollout_path: &str,
+    line_number: usize,
+    thread_id: Option<String>,
+    timestamp: Option<String>,
+    preview_chars: usize,
+) -> PartialToolCall {
+    let arguments_text = payload.get("path").map(value_to_text).unwrap_or_default();
+    let (arguments_preview, arguments_bytes) = preview_text(&arguments_text, preview_chars);
+    PartialToolCall {
+        thread_id,
+        timestamp,
+        rollout_path: rollout_path.to_string(),
+        call_line: line_number,
+        output_line: None,
+        tool_kind: "event".to_string(),
+        tool_name: "view_image".to_string(),
+        call_id: event_call_id(payload),
+        status: None,
+        command: None,
+        cwd: None,
+        arguments_preview,
+        arguments_bytes: Some(arguments_bytes),
+        output_preview: None,
+        output_bytes: None,
+    }
+}
+
+fn parse_web_search_end(
+    payload: &Value,
+    rollout_path: &str,
+    line_number: usize,
+    thread_id: Option<String>,
+    timestamp: Option<String>,
+    preview_chars: usize,
+) -> PartialToolCall {
+    let arguments_text = payload
+        .get("query")
+        .or_else(|| payload.get("action"))
+        .map(value_to_text)
+        .unwrap_or_default();
+    let (arguments_preview, arguments_bytes) = preview_text(&arguments_text, preview_chars);
+    PartialToolCall {
+        thread_id,
+        timestamp,
+        rollout_path: rollout_path.to_string(),
+        call_line: line_number,
+        output_line: None,
+        tool_kind: "web_search".to_string(),
+        tool_name: "web_search".to_string(),
+        call_id: event_call_id(payload),
+        status: None,
+        command: None,
+        cwd: None,
+        arguments_preview,
+        arguments_bytes: Some(arguments_bytes),
+        output_preview: None,
+        output_bytes: None,
+    }
 }
 
 fn parse_exec_event(
@@ -458,6 +821,97 @@ fn parse_exec_event(
         parsed_commands: parse_parsed_commands(payload.get("parsed_cmd")),
         output_preview,
         output_bytes: Some(output_bytes),
+    }
+}
+
+fn event_call_id(payload: &Value) -> Option<String> {
+    payload
+        .get("call_id")
+        .or_else(|| payload.get("callId"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn event_tool_name(payload: &Value) -> Option<String> {
+    let tool = payload.get("tool").and_then(Value::as_str)?;
+    let namespace = payload
+        .get("namespace")
+        .and_then(Value::as_str)
+        .filter(|namespace| !namespace.is_empty());
+    Some(
+        namespace
+            .map(|namespace| format!("{namespace}.{tool}"))
+            .unwrap_or_else(|| tool.to_string()),
+    )
+}
+
+fn bool_status(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_bool).map(|success| {
+        if success {
+            "completed".to_string()
+        } else {
+            "failed".to_string()
+        }
+    })
+}
+
+fn mcp_result_status(payload: &Value) -> Option<String> {
+    let result = payload.get("result")?;
+    if result.get("Ok").is_some() {
+        Some("completed".to_string())
+    } else if result.get("Err").is_some() {
+        Some("failed".to_string())
+    } else {
+        payload
+            .get("status")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    }
+}
+
+fn dynamic_response_status(payload: &Value) -> Option<String> {
+    payload
+        .get("status")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| bool_status(payload.get("success")))
+        .or_else(|| {
+            payload
+                .get("error")
+                .filter(|error| !error.is_null())
+                .map(|_| "failed".to_string())
+        })
+}
+
+fn dynamic_response_output(payload: &Value) -> String {
+    payload
+        .get("content_items")
+        .or_else(|| payload.get("error"))
+        .or_else(|| payload.get("result"))
+        .map(value_to_text)
+        .unwrap_or_default()
+}
+
+fn event_output_text(payload: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(stdout) = payload.get("stdout").map(value_to_text) {
+        if !stdout.is_empty() {
+            parts.push(stdout);
+        }
+    }
+    if let Some(stderr) = payload.get("stderr").map(value_to_text) {
+        if !stderr.is_empty() {
+            parts.push(stderr);
+        }
+    }
+    if parts.is_empty() {
+        payload
+            .get("result")
+            .or_else(|| payload.get("output"))
+            .map(value_to_text)
+            .unwrap_or_default()
+    } else {
+        parts.join("\n")
     }
 }
 
@@ -733,7 +1187,13 @@ mod tests {
                 "{\"timestamp\":\"2026-06-14T01:02:04Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call_exec\",\"arguments\":\"{\\\"cmd\\\":\\\"echo ok\\\",\\\"workdir\\\":\\\"/tmp/project\\\"}\"}}\n",
                 "{\"timestamp\":\"2026-06-14T01:02:05Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call_exec\",\"output\":\"hello from command\"}}\n",
                 "{\"timestamp\":\"2026-06-14T01:02:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"apply_patch\",\"call_id\":\"call_patch\",\"input\":\"*** Begin Patch\"}}\n",
-                "{\"timestamp\":\"2026-06-14T01:02:07Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call_patch\",\"output\":\"patch applied\"}}\n"
+                "{\"timestamp\":\"2026-06-14T01:02:07Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call_patch\",\"output\":\"patch applied\"}}\n",
+                "{\"timestamp\":\"2026-06-14T01:02:08Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"mcp_tool_call_end\",\"call_id\":\"call_mcp\",\"invocation\":{\"server\":\"codex_app\",\"tool\":\"read_thread_terminal\",\"arguments\":{\"limit\":10}},\"result\":{\"Ok\":\"terminal output\"},\"duration\":{\"secs\":0,\"nanos\":1000}}}\n",
+                "{\"timestamp\":\"2026-06-14T01:02:09Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"patch_apply_end\",\"call_id\":\"call_patch_event\",\"stdout\":\"patch event output\",\"stderr\":\"\",\"success\":true,\"changes\":[{\"path\":\"src/lib.rs\"}],\"status\":\"completed\"}}\n",
+                "{\"timestamp\":\"2026-06-14T01:02:10Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"dynamic_tool_call_request\",\"callId\":\"call_dynamic\",\"namespace\":\"codex_app\",\"tool\":\"load_workspace_dependencies\",\"arguments\":{\"include\":\"runtime\"}}}\n",
+                "{\"timestamp\":\"2026-06-14T01:02:11Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"dynamic_tool_call_response\",\"call_id\":\"call_dynamic\",\"tool\":\"load_workspace_dependencies\",\"success\":true,\"content_items\":[{\"text\":\"deps loaded\"}]}}\n",
+                "{\"timestamp\":\"2026-06-14T01:02:12Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"view_image_tool_call\",\"call_id\":\"call_view\",\"path\":\"/tmp/image.png\"}}\n",
+                "{\"timestamp\":\"2026-06-14T01:02:13Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"exec_command_output\",\"call_id\":\"call_stream\",\"stdout\":\"streamed output\"}}\n"
             ),
         )
         .unwrap();
@@ -756,11 +1216,11 @@ mod tests {
                 rollouts_scanned: 2,
                 live_rollouts: 1,
                 archived_rollouts: 1,
-                json_lines_read: 6,
+                json_lines_read: 12,
                 malformed_lines: 1,
-                tool_calls_indexed: 2,
-                command_executions_indexed: 2,
-                output_previews_indexed: 2,
+                tool_calls_indexed: 6,
+                command_executions_indexed: 3,
+                output_previews_indexed: 5,
                 errors: 0,
                 index_dir: ".ucp_history".to_string(),
             }
@@ -771,27 +1231,49 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(tool_lines.len(), 2);
+        assert_eq!(tool_lines.len(), 6);
         assert_eq!(tool_lines[0]["thread_id"], "thread-live");
         assert_eq!(tool_lines[0]["command"], "echo ok");
         assert_eq!(tool_lines[1]["tool_name"], "apply_patch");
+        assert!(tool_lines
+            .iter()
+            .any(|line| line["tool_name"] == "codex_app.read_thread_terminal"
+                && line["status"] == "completed"));
+        assert!(tool_lines
+            .iter()
+            .any(|line| line["tool_name"] == "apply_patch"
+                && line["call_id"] == "call_patch_event"
+                && line["output_preview"] == "patch event output"));
+        assert!(tool_lines.iter().any(|line| line["tool_name"]
+            == "codex_app.load_workspace_dependencies"
+            && line["output_preview"]
+                .as_str()
+                .is_some_and(|preview| preview.contains("deps loaded"))));
+        assert!(tool_lines
+            .iter()
+            .any(|line| line["tool_name"] == "view_image"
+                && line["arguments_preview"] == "/tmp/image.png"));
 
         let exec_lines: Vec<Value> = fs::read_to_string(index_dir.join("command_executions.jsonl"))
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(exec_lines.len(), 2);
+        assert_eq!(exec_lines.len(), 3);
         assert_eq!(exec_lines[0]["command"], "echo ok");
         assert_eq!(exec_lines[0]["cwd"], "/tmp/project");
-        assert_eq!(exec_lines[1]["command"], "printf old");
-        assert_eq!(exec_lines[1]["exit_code"], 0);
-        assert_eq!(exec_lines[1]["duration_ms"], 1500);
+        assert!(exec_lines
+            .iter()
+            .any(|line| line["call_id"] == "call_stream"
+                && line["output_preview"] == "streamed output"));
+        assert!(exec_lines.iter().any(|line| line["command"] == "printf old"
+            && line["exit_code"] == 0
+            && line["duration_ms"] == 1500));
 
         let summary_json: HistoryIndexSummary =
             serde_json::from_str(&fs::read_to_string(index_dir.join("summary.json")).unwrap())
                 .unwrap();
-        assert_eq!(summary_json.command_executions_indexed, 2);
+        assert_eq!(summary_json.command_executions_indexed, 3);
 
         let _ = fs::remove_dir_all(&root);
     }
