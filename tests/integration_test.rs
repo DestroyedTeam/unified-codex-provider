@@ -310,6 +310,16 @@ fn test_switch_syncs_rollout_metadata_only_by_default_and_updates_db() {
         .collect();
     assert_eq!(new_lines[2], original_lines[2]);
     assert_eq!(new_lines[3], original_lines[3]);
+    assert!(new_lines.iter().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .is_some_and(|row| {
+                row["type"] == "response_item"
+                    && row["payload"]["ucp_display_projection"] == true
+                    && row["payload"]["type"] == "function_call_output"
+                    && row["payload"]["output"] == "tool output stays"
+            })
+    }));
     assert_eq!(
         read_thread_model(&db_path),
         (Some("target".to_string()), Some("gpt-5.5".to_string()))
@@ -323,7 +333,7 @@ fn test_switch_syncs_rollout_metadata_only_by_default_and_updates_db() {
         .iter()
         .any(|dir| dir.join("sessions").join("rollout-test.jsonl").exists()));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("metadata rows only"));
+    assert!(stdout.contains("display projections"));
 
     let _ = fs::remove_dir_all(&home);
 }
@@ -375,6 +385,7 @@ fn test_switch_rebuilds_history_index_by_default_without_printing_outputs() {
 
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Display projections: added 6 response item row(s)"));
     assert!(stdout.contains("History index: 2 rollout(s), 4 tool call(s), 2 command execution(s)"));
     assert!(!stdout.contains(hidden_output));
 
@@ -402,6 +413,19 @@ fn test_switch_rebuilds_history_index_by_default_without_printing_outputs() {
         && call["output_preview"]
             .as_str()
             .is_some_and(|preview| preview.contains("deps loaded"))));
+
+    let live_rows = parse_jsonl(&live_rollout);
+    assert!(live_rows.iter().any(|row| row["type"] == "response_item"
+        && row["payload"]["ucp_display_projection"] == true
+        && row["payload"]["type"] == "custom_tool_call"
+        && row["payload"]["name"] == "codex_app.read_thread_terminal"));
+    assert!(live_rows.iter().any(|row| row["type"] == "response_item"
+        && row["payload"]["ucp_display_projection"] == true
+        && row["payload"]["type"] == "custom_tool_call_output"
+        && row["payload"]["call_id"] == "call_dynamic"
+        && row["payload"]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("deps loaded"))));
 
     let commands = parse_jsonl(&index_dir.join("command_executions.jsonl"));
     assert_eq!(commands.len(), 2);

@@ -256,6 +256,9 @@ fn index_rollout_file(
 
         match payload_type {
             "function_call" | "custom_tool_call" | "tool_search_call" | "web_search_call" => {
+                if is_ucp_display_projection(payload) {
+                    continue;
+                }
                 let Some(call) = parse_tool_call(
                     payload,
                     payload_type,
@@ -273,6 +276,9 @@ fn index_rollout_file(
                 calls.push(call);
             }
             "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
+                if is_ucp_display_projection(payload) {
+                    continue;
+                }
                 let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
                     continue;
                 };
@@ -1103,6 +1109,13 @@ fn session_meta_id(value: &Value) -> Option<String> {
         .and_then(|payload| payload.get("id"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+fn is_ucp_display_projection(payload: &Value) -> bool {
+    payload
+        .get("ucp_display_projection")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn value_to_text(value: &Value) -> String {

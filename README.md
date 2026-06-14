@@ -88,11 +88,15 @@ ucp remove old-profile
 ```
 
 `ucp switch` and `ucp sync` update only `session_meta` and `turn_context` rows
-inside historical `rollout-*.jsonl` files by default. Tool calls, command
-outputs, assistant messages, and other event rows are left byte-for-byte
-unchanged. If you are intentionally repairing an old corrupted rollout and want
-the legacy full-file rewrite behavior, pass `--rewrite-rollouts`; UCP will back
-up matching rollout files and SQLite state files first.
+inside historical `rollout-*.jsonl` files by default. Original tool calls,
+command outputs, assistant messages, and other event rows are left byte-for-byte
+unchanged. When a top-level low-level `event_msg` has no renderable
+`response_item`, UCP adds marked display projection rows next to the original
+event so local Codex history replay can show command/tool activity without
+destroying the source event. If you are intentionally repairing an old corrupted
+rollout and want the legacy full-file rewrite behavior, pass
+`--rewrite-rollouts`; UCP will back up matching rollout files and SQLite state
+files first.
 
 Every switch/sync also refreshes `~/.codex/.ucp_history/` from the raw rollout
 files under both `sessions/` and `archived_sessions/`. The generated
@@ -100,7 +104,9 @@ files under both `sessions/` and `archived_sessions/`. The generated
 read-only audit index: they list recovered tool calls, command/cwd/exit status,
 rollout path, and source line references without rewriting the original
 rollout history. Command output is stored only as a bounded preview in the
-index and is not printed by default during switch/sync.
+index and is not printed by default during switch/sync. UCP's audit index
+ignores its own marked display projection rows so the original low-level events
+remain the single source for recovered tool/command counts.
 
 ## Shell Completion
 
