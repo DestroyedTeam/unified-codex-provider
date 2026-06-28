@@ -129,6 +129,12 @@ enum Commands {
         #[arg(long, default_value_t = 3)]
         keep: usize,
     },
+    /// Scan or repair historical rollout rows rejected by newer Codex versions
+    RepairSessions {
+        /// Back up affected rollouts and apply the repair; default is dry-run
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -289,6 +295,39 @@ fn main() -> Result<()> {
             sessions::prune_session_backups(keep);
             println!("Done.");
         }
+        Commands::RepairSessions { apply } => {
+            if apply {
+                println!(
+                    "Repairing incompatible session rows after backing up affected rollouts..."
+                );
+            } else {
+                println!("Scanning incompatible session rows (dry-run)...");
+            }
+            let summary = sessions::repair_session_history(apply)?;
+            println!(
+                "  Rollouts: {} scanned, {} affected, {} repaired, {} errors",
+                summary.rollouts_scanned,
+                summary.rollouts_affected,
+                summary.rollouts_repaired,
+                summary.errors
+            );
+            if apply {
+                println!(
+                    "  Rows: {} UCP display projection(s) removed, {} invalid tool name(s) normalized",
+                    summary.projection_rows_removed, summary.invalid_names_normalized
+                );
+            } else {
+                println!(
+                    "  Rows: {} UCP display projection(s) to remove, {} invalid tool name(s) to normalize",
+                    summary.projection_rows_removed, summary.invalid_names_normalized
+                );
+            }
+            if let Some(backup_dir) = summary.backup_dir {
+                println!("  Backups: {}", backup_dir.display());
+            } else if !apply && summary.rollouts_affected > 0 {
+                println!("  Dry-run only. Re-run with --apply to back up and repair.");
+            }
+        }
     }
     Ok(())
 }
@@ -379,7 +418,7 @@ const BASH_COMPLETION: &str = r#"_ucp()
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "status list switch remove delete rm add init import-auth login sync setup doctor service completions" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "status list switch remove delete rm add init import-auth login sync setup doctor service completions repair-sessions" -- "${cur}") )
         return 0
     fi
 
@@ -411,6 +450,9 @@ const BASH_COMPLETION: &str = r#"_ucp()
             ;;
         sync)
             COMPREPLY=( $(compgen -W "--auto --rewrite-rollouts" -- "${cur}") )
+            ;;
+        repair-sessions)
+            COMPREPLY=( $(compgen -W "--apply" -- "${cur}") )
             ;;
         setup)
             COMPREPLY=( $(compgen -W "--no-service" -- "${cur}") )
@@ -453,6 +495,7 @@ _ucp()
         'doctor:Diagnose local environment'
         'service:Manage macOS auto-sync service'
         'completions:Generate shell completion script'
+        'repair-sessions:Scan or repair incompatible historical session rows'
     )
 
     _arguments -C \
@@ -499,6 +542,9 @@ _ucp()
                         '--auto[Run LaunchAgent-style auto sync]' \
                         '--rewrite-rollouts[Danger: full rewrite of historical rollout JSONL rows after backup]'
                     ;;
+                repair-sessions)
+                    _arguments '--apply[Back up affected rollouts and apply repairs]'
+                    ;;
                 setup)
                     _arguments '--no-service[Skip macOS LaunchAgent installation]'
                     ;;
@@ -544,6 +590,7 @@ complete -c ucp -n '__fish_is_first_arg' -a 'setup' -d 'Run first-time setup'
 complete -c ucp -n '__fish_is_first_arg' -a 'doctor' -d 'Diagnose local environment'
 complete -c ucp -n '__fish_is_first_arg' -a 'service' -d 'Manage macOS auto-sync service'
 complete -c ucp -n '__fish_is_first_arg' -a 'completions' -d 'Generate shell completion script'
+complete -c ucp -n '__fish_is_first_arg' -a 'repair-sessions' -d 'Scan or repair incompatible historical session rows'
 complete -c ucp -n '__fish_seen_subcommand_from switch' -a '(ucp __complete profile (commandline -ct) 2>/dev/null)' -d 'Provider profile'
 complete -c ucp -n '__fish_seen_subcommand_from switch' -l rewrite-rollouts -d 'Danger: full rewrite of historical rollout JSONL rows after backup'
 complete -c ucp -n '__fish_seen_subcommand_from remove delete rm; and not string match -q -- "-*" (commandline -ct)' -a '(ucp __complete profile (commandline -ct) 2>/dev/null)' -d 'Provider profile'
@@ -554,6 +601,7 @@ complete -c ucp -n '__fish_seen_subcommand_from import-auth; and not string matc
 complete -c ucp -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
 complete -c ucp -n '__fish_seen_subcommand_from sync' -l auto -d 'Run LaunchAgent-style auto sync'
 complete -c ucp -n '__fish_seen_subcommand_from sync' -l rewrite-rollouts -d 'Danger: full rewrite of historical rollout JSONL rows after backup'
+complete -c ucp -n '__fish_seen_subcommand_from repair-sessions' -l apply -d 'Back up affected rollouts and apply repairs'
 complete -c ucp -n '__fish_seen_subcommand_from setup' -l no-service -d 'Skip macOS LaunchAgent installation'
 complete -c ucp -n '__fish_seen_subcommand_from service' -a 'install status uninstall'
 complete -c ucp -n '__fish_seen_subcommand_from login' -l name -d 'Profile name' -r

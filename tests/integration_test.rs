@@ -147,6 +147,7 @@ fn test_help_output() {
     assert!(stdout.contains("setup"));
     assert!(stdout.contains("doctor"));
     assert!(stdout.contains("service"));
+    assert!(stdout.contains("repair-sessions"));
 }
 
 #[test]
@@ -310,16 +311,7 @@ fn test_switch_syncs_rollout_metadata_only_by_default_and_updates_db() {
         .collect();
     assert_eq!(new_lines[2], original_lines[2]);
     assert_eq!(new_lines[3], original_lines[3]);
-    assert!(new_lines.iter().any(|line| {
-        serde_json::from_str::<serde_json::Value>(line)
-            .ok()
-            .is_some_and(|row| {
-                row["type"] == "response_item"
-                    && row["payload"]["ucp_display_projection"] == true
-                    && row["payload"]["type"] == "function_call_output"
-                    && row["payload"]["output"] == "tool output stays"
-            })
-    }));
+    assert_eq!(new_lines.len(), original_lines.len());
     assert_eq!(
         read_thread_model(&db_path),
         (Some("target".to_string()), Some("gpt-5.5".to_string()))
@@ -333,7 +325,7 @@ fn test_switch_syncs_rollout_metadata_only_by_default_and_updates_db() {
         .iter()
         .any(|dir| dir.join("sessions").join("rollout-test.jsonl").exists()));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("display projections"));
+    assert!(stdout.contains("metadata rows only"));
 
     let _ = fs::remove_dir_all(&home);
 }
@@ -385,7 +377,6 @@ fn test_switch_rebuilds_history_index_by_default_without_printing_outputs() {
 
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Display projections: added 6 response item row(s)"));
     assert!(stdout.contains("History index: 2 rollout(s), 4 tool call(s), 2 command execution(s)"));
     assert!(!stdout.contains(hidden_output));
 
@@ -415,17 +406,12 @@ fn test_switch_rebuilds_history_index_by_default_without_printing_outputs() {
             .is_some_and(|preview| preview.contains("deps loaded"))));
 
     let live_rows = parse_jsonl(&live_rollout);
-    assert!(live_rows.iter().any(|row| row["type"] == "response_item"
-        && row["payload"]["ucp_display_projection"] == true
-        && row["payload"]["type"] == "custom_tool_call"
-        && row["payload"]["name"] == "codex_app.read_thread_terminal"));
-    assert!(live_rows.iter().any(|row| row["type"] == "response_item"
-        && row["payload"]["ucp_display_projection"] == true
-        && row["payload"]["type"] == "custom_tool_call_output"
-        && row["payload"]["call_id"] == "call_dynamic"
-        && row["payload"]["output"]
-            .as_str()
-            .is_some_and(|output| output.contains("deps loaded"))));
+    assert!(live_rows
+        .iter()
+        .all(|row| row["payload"]["ucp_display_projection"] != true));
+    assert!(live_rows
+        .iter()
+        .any(|row| row["type"] == "event_msg" && row["payload"]["type"] == "mcp_tool_call_end"));
 
     let commands = parse_jsonl(&index_dir.join("command_executions.jsonl"));
     assert_eq!(commands.len(), 2);
@@ -435,6 +421,63 @@ fn test_switch_rebuilds_history_index_by_default_without_printing_outputs() {
     assert_eq!(commands[1]["command"], "printf old");
     assert_eq!(commands[1]["exit_code"], 0);
     assert_eq!(commands[1]["duration_ms"], 1500);
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_repair_sessions_dry_run_then_apply_with_backup() {
+    let home = temp_home("repair_sessions");
+    let sessions = home.join(".codex").join("sessions");
+    fs::create_dir_all(&sessions).expect("create sessions dir");
+    let rollout = sessions.join("rollout-incompatible.jsonl");
+    let original = concat!(
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"computer-use.click\",\"call_id\":\"projection-call\",\"input\":\"{}\",\"ucp_display_projection\":true}}\n",
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"projection-call\",\"output\":\"ok\",\"ucp_display_projection\":true}}\n",
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"node_repl.js\",\"call_id\":\"native-call\",\"input\":\"{}\"}}\n",
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"native-call\",\"output\":\"ok\"}}\n"
+    );
+    fs::write(&rollout, original).expect("write incompatible rollout");
+
+    let dry_run = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .arg("repair-sessions")
+        .output()
+        .expect("run repair-sessions dry-run");
+    assert_success(&dry_run);
+    let dry_stdout = String::from_utf8_lossy(&dry_run.stdout);
+    assert!(dry_stdout.contains("1 affected, 0 repaired"));
+    assert!(dry_stdout.contains("Dry-run only"));
+    assert_eq!(fs::read_to_string(&rollout).unwrap(), original);
+    assert!(session_backup_dirs(&home).is_empty());
+
+    let applied = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .args(["repair-sessions", "--apply"])
+        .output()
+        .expect("run repair-sessions apply");
+    assert_success(&applied);
+    let applied_stdout = String::from_utf8_lossy(&applied.stdout);
+    assert!(applied_stdout.contains("1 affected, 1 repaired"));
+    assert!(applied_stdout.contains("2 UCP display projection(s) removed"));
+    assert!(applied_stdout.contains("1 invalid tool name(s) normalized"));
+
+    let repaired = fs::read_to_string(&rollout).unwrap();
+    assert!(!repaired.contains("ucp_display_projection"));
+    assert!(repaired.contains("\"name\":\"node_repl_js\""));
+    assert!(repaired.contains("\"call_id\":\"native-call\""));
+
+    let backups = session_backup_dirs(&home);
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        fs::read_to_string(
+            backups[0]
+                .join("sessions")
+                .join("rollout-incompatible.jsonl")
+        )
+        .unwrap(),
+        original
+    );
 
     let _ = fs::remove_dir_all(&home);
 }

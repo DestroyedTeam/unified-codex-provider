@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Local;
 use filetime::FileTime;
-use serde_json::{json, Value};
-use std::collections::HashSet;
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -21,7 +20,6 @@ pub struct SessionSyncSummary {
     pub rollouts_skipped: usize,
     pub rollout_errors: usize,
     pub metadata_lines_updated: usize,
-    pub display_lines_added: usize,
     pub db_records_updated: usize,
     pub db_backup_files: usize,
     pub db_errors: usize,
@@ -43,10 +41,11 @@ struct DbUpdateSummary {
 /// By default only rollout metadata rows are rewritten: `session_meta` carries
 /// the provider identity and `turn_context` carries the model. Tool calls,
 /// command outputs, assistant messages, and other event rows remain byte-for-
-/// byte unchanged. UCP may add marked `response_item` display projection rows
-/// for top-level low-level event messages so Codex history replay can render
-/// them. A full rollout rewrite is still available as an explicit recovery
-/// operation through `SessionSyncOptions::full_rollout_rewrite`.
+/// byte unchanged. Tool/event rendering belongs in the separate history audit
+/// index; adding synthetic response items to rollout files can cause those
+/// display-only rows to be replayed as model input. A full rollout rewrite is
+/// still available as an explicit recovery operation through
+/// `SessionSyncOptions::full_rollout_rewrite`.
 pub fn unify_sessions(
     target_provider: &str,
     target_model: &str,
@@ -62,9 +61,7 @@ pub fn unify_sessions(
             "  Warning: full rollout JSONL rewrite enabled; originals will be backed up first."
         );
     } else {
-        println!(
-            "  Rollout JSONL: syncing metadata rows and display projections; original event/tool rows stay unchanged."
-        );
+        println!("  Rollout JSONL: syncing metadata rows only; event/tool rows stay unchanged.");
     }
     sync_rollout_files(
         target_provider,
@@ -99,13 +96,6 @@ pub fn unify_sessions(
             backup_dir.display()
         );
     }
-    if summary.display_lines_added > 0 {
-        println!(
-            "  Display projections: added {} response item row(s)",
-            summary.display_lines_added
-        );
-    }
-
     match history::refresh_history_index() {
         Ok(history_summary) => {
             summary.history_rollouts_scanned = history_summary.rollouts_scanned;
@@ -197,11 +187,9 @@ fn sync_rollout_files(
                 Ok(ProcessSessionFileResult {
                     modified: true,
                     lines_updated,
-                    display_lines_added,
                 }) => {
                     summary.rollouts_modified += 1;
                     summary.metadata_lines_updated += lines_updated;
-                    summary.display_lines_added += display_lines_added;
                 }
                 Ok(ProcessSessionFileResult {
                     modified: false, ..
@@ -219,7 +207,173 @@ fn sync_rollout_files(
 struct ProcessSessionFileResult {
     modified: bool,
     lines_updated: usize,
-    display_lines_added: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SessionRepairSummary {
+    pub rollouts_scanned: usize,
+    pub rollouts_affected: usize,
+    pub rollouts_repaired: usize,
+    pub projection_rows_removed: usize,
+    pub invalid_names_normalized: usize,
+    pub errors: usize,
+    pub backup_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RepairFileResult {
+    affected: bool,
+    projection_rows_removed: usize,
+    invalid_names_normalized: usize,
+}
+
+/// Scan or repair rollout rows that newer Responses API validation rejects.
+///
+/// UCP-owned display projections are removed because they are synthetic UI
+/// data and must not become model input. Invalid names on non-UCP historical
+/// tool calls are normalized while retaining their call IDs and output pairs.
+pub fn repair_session_history(apply: bool) -> Result<SessionRepairSummary> {
+    let mut summary = SessionRepairSummary::default();
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S_%f");
+    let backup_dir = codex_dir().join(format!(".sessions_backup_repair_{timestamp}"));
+
+    for root_name in ["sessions", "archived_sessions"] {
+        let root = codex_dir().join(root_name);
+        if !root.exists() {
+            continue;
+        }
+
+        for entry in WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+        {
+            let path = entry.path();
+            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+            if !path.is_file()
+                || !file_name.starts_with("rollout-")
+                || !file_name.ends_with(".jsonl")
+            {
+                continue;
+            }
+
+            summary.rollouts_scanned += 1;
+            match repair_rollout_file(path, &backup_dir, apply) {
+                Ok(result) => {
+                    if result.affected {
+                        summary.rollouts_affected += 1;
+                        if apply {
+                            summary.rollouts_repaired += 1;
+                        }
+                    }
+                    summary.projection_rows_removed += result.projection_rows_removed;
+                    summary.invalid_names_normalized += result.invalid_names_normalized;
+                }
+                Err(error) => {
+                    eprintln!("  Error repairing {}: {error}", path.display());
+                    summary.errors += 1;
+                }
+            }
+        }
+    }
+
+    if apply && summary.rollouts_repaired > 0 {
+        summary.backup_dir = Some(backup_dir);
+    } else {
+        let _ = fs::remove_dir(&backup_dir);
+    }
+
+    Ok(summary)
+}
+
+fn repair_rollout_file(path: &Path, backup_dir: &Path, apply: bool) -> Result<RepairFileResult> {
+    let content = fs::read_to_string(path)?;
+    let mut result = RepairFileResult::default();
+    let mut repaired_lines = Vec::with_capacity(content.lines().count());
+
+    for line in content.lines() {
+        let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+            repaired_lines.push(line.to_string());
+            continue;
+        };
+
+        let is_response_item = value.get("type").and_then(Value::as_str) == Some("response_item");
+        let is_ucp_projection = is_response_item
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("ucp_display_projection"))
+                .and_then(Value::as_bool)
+                == Some(true);
+
+        if is_ucp_projection {
+            result.affected = true;
+            result.projection_rows_removed += 1;
+            continue;
+        }
+
+        let mut normalized = false;
+        if is_response_item {
+            if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+                let is_tool_call = matches!(
+                    payload.get("type").and_then(Value::as_str),
+                    Some("function_call" | "custom_tool_call")
+                );
+                if is_tool_call {
+                    if let Some(name) = payload.get("name").and_then(Value::as_str) {
+                        if !is_valid_tool_name(name) {
+                            payload.insert(
+                                "name".to_string(),
+                                Value::String(normalize_tool_name(name)),
+                            );
+                            normalized = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if normalized {
+            result.affected = true;
+            result.invalid_names_normalized += 1;
+            repaired_lines.push(serde_json::to_string(&value)?);
+        } else {
+            repaired_lines.push(line.to_string());
+        }
+    }
+
+    if apply && result.affected {
+        backup_session_file(path, backup_dir)?;
+        write_session_content_preserving_mtime(path, &content, repaired_lines)?;
+    }
+
+    Ok(result)
+}
+
+fn is_valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut last_was_separator = false;
+    for character in name.chars() {
+        let valid = character.is_ascii_alphanumeric() || character == '_' || character == '-';
+        if valid {
+            normalized.push(character);
+            last_was_separator = false;
+        } else if !last_was_separator {
+            normalized.push('_');
+            last_was_separator = true;
+        }
+    }
+    let normalized = normalized.trim_matches('_');
+    if normalized.is_empty() {
+        "legacy_tool".to_string()
+    } else {
+        normalized.to_string()
+    }
 }
 
 /// Process a single session file using the legacy full rewrite behavior.
@@ -275,7 +429,6 @@ fn process_session_file(
     Ok(ProcessSessionFileResult {
         modified: true,
         lines_updated,
-        display_lines_added: 0,
     })
 }
 
@@ -294,29 +447,16 @@ fn process_session_metadata_file(
 
     let mut changed = false;
     let mut lines_updated = 0usize;
-    let mut display_lines_added = 0usize;
     let mut new_lines: Vec<String> = Vec::with_capacity(lines.len());
-    let mut display_state = DisplayProjectionState::from_lines(&lines);
 
-    for (idx, line) in lines.iter().enumerate() {
+    for line in lines.iter() {
         let Some(updated) = rewrite_metadata_line(line, target_provider, target_model)? else {
             new_lines.push(line.to_string());
-            let projections = display_projection_lines(line, idx + 1, &mut display_state)?;
-            if !projections.is_empty() {
-                display_lines_added += projections.len();
-                changed = true;
-                new_lines.extend(projections);
-            }
             continue;
         };
         changed = true;
         lines_updated += 1;
         new_lines.push(updated);
-        let projections = display_projection_lines(line, idx + 1, &mut display_state)?;
-        if !projections.is_empty() {
-            display_lines_added += projections.len();
-            new_lines.extend(projections);
-        }
     }
 
     if !changed {
@@ -329,451 +469,7 @@ fn process_session_metadata_file(
     Ok(ProcessSessionFileResult {
         modified: true,
         lines_updated,
-        display_lines_added,
     })
-}
-
-#[derive(Debug, Default)]
-struct DisplayProjectionState {
-    call_ids: HashSet<String>,
-    output_ids: HashSet<String>,
-}
-
-impl DisplayProjectionState {
-    fn from_lines(lines: &[&str]) -> Self {
-        let mut state = Self::default();
-        for line in lines {
-            let Ok(value) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if value.get("type").and_then(Value::as_str) != Some("response_item") {
-                continue;
-            }
-            let Some(payload) = value.get("payload") else {
-                continue;
-            };
-            let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
-                continue;
-            };
-            match payload.get("type").and_then(Value::as_str) {
-                Some(
-                    "function_call" | "custom_tool_call" | "tool_search_call" | "web_search_call",
-                ) => {
-                    state.call_ids.insert(call_id.to_string());
-                }
-                Some("function_call_output" | "custom_tool_call_output" | "tool_search_output") => {
-                    state.output_ids.insert(call_id.to_string());
-                }
-                _ => {}
-            }
-        }
-        state
-    }
-}
-
-fn display_projection_lines(
-    line: &str,
-    line_number: usize,
-    state: &mut DisplayProjectionState,
-) -> Result<Vec<String>> {
-    let Ok(value) = serde_json::from_str::<Value>(line) else {
-        return Ok(Vec::new());
-    };
-    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
-        return Ok(Vec::new());
-    }
-    let Some(payload) = value.get("payload") else {
-        return Ok(Vec::new());
-    };
-    let Some(payload_type) = payload.get("type").and_then(Value::as_str) else {
-        return Ok(Vec::new());
-    };
-
-    let fallback_call_id = format!("ucp-display-{}-{}", payload_type, line_number);
-    let call_id = event_call_id(payload).unwrap_or(fallback_call_id);
-    let mut projections = Vec::new();
-
-    match payload_type {
-        "exec_command_end" | "exec_command_output" => {
-            let command = exec_command_text(payload).unwrap_or_else(|| payload_type.to_string());
-            let mut args = json!({ "cmd": command });
-            if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
-                args["workdir"] = Value::String(cwd.to_string());
-            }
-            push_call_projection(
-                &mut projections,
-                state,
-                &value,
-                &call_id,
-                "function_call",
-                "exec_command",
-                serde_json::to_string(&args)?,
-                event_status(payload),
-            )?;
-            if let Some(output) = event_output_text(payload) {
-                push_output_projection(
-                    &mut projections,
-                    state,
-                    &value,
-                    &call_id,
-                    "function_call_output",
-                    output,
-                )?;
-            }
-        }
-        "mcp_tool_call_end" => {
-            let invocation = payload.get("invocation").unwrap_or(&Value::Null);
-            let tool_name = mcp_tool_name(invocation);
-            let input = invocation
-                .get("arguments")
-                .map(value_to_text)
-                .unwrap_or_default();
-            push_call_projection(
-                &mut projections,
-                state,
-                &value,
-                &call_id,
-                "custom_tool_call",
-                &tool_name,
-                input,
-                mcp_status(payload),
-            )?;
-            if let Some(output) = payload.get("result").map(value_to_text) {
-                push_output_projection(
-                    &mut projections,
-                    state,
-                    &value,
-                    &call_id,
-                    "custom_tool_call_output",
-                    truncate_projection_output(output),
-                )?;
-            }
-        }
-        "patch_apply_end" => {
-            let input = payload
-                .get("changes")
-                .map(value_to_text)
-                .unwrap_or_default();
-            push_call_projection(
-                &mut projections,
-                state,
-                &value,
-                &call_id,
-                "custom_tool_call",
-                "apply_patch",
-                input,
-                event_status(payload),
-            )?;
-            if let Some(output) = event_output_text(payload) {
-                push_output_projection(
-                    &mut projections,
-                    state,
-                    &value,
-                    &call_id,
-                    "custom_tool_call_output",
-                    output,
-                )?;
-            }
-        }
-        "dynamic_tool_call_request" => {
-            let Some(tool_name) = dynamic_tool_name(payload) else {
-                return Ok(projections);
-            };
-            let input = payload
-                .get("arguments")
-                .map(value_to_text)
-                .unwrap_or_default();
-            push_call_projection(
-                &mut projections,
-                state,
-                &value,
-                &call_id,
-                "custom_tool_call",
-                &tool_name,
-                input,
-                None,
-            )?;
-        }
-        "dynamic_tool_call_response" => {
-            let Some(tool_name) = dynamic_tool_name(payload) else {
-                return Ok(projections);
-            };
-            if !state.call_ids.contains(&call_id) {
-                let input = payload
-                    .get("arguments")
-                    .map(value_to_text)
-                    .unwrap_or_default();
-                push_call_projection(
-                    &mut projections,
-                    state,
-                    &value,
-                    &call_id,
-                    "custom_tool_call",
-                    &tool_name,
-                    input,
-                    dynamic_status(payload),
-                )?;
-            }
-            if let Some(output) = dynamic_output(payload) {
-                push_output_projection(
-                    &mut projections,
-                    state,
-                    &value,
-                    &call_id,
-                    "custom_tool_call_output",
-                    output,
-                )?;
-            }
-        }
-        "view_image_tool_call" => {
-            let input = payload.get("path").map(value_to_text).unwrap_or_default();
-            push_call_projection(
-                &mut projections,
-                state,
-                &value,
-                &call_id,
-                "custom_tool_call",
-                "view_image",
-                input,
-                None,
-            )?;
-        }
-        "web_search_end" => {
-            let input = payload
-                .get("query")
-                .or_else(|| payload.get("action"))
-                .map(value_to_text)
-                .unwrap_or_default();
-            push_call_projection(
-                &mut projections,
-                state,
-                &value,
-                &call_id,
-                "web_search_call",
-                "web_search",
-                input,
-                None,
-            )?;
-        }
-        _ => {}
-    }
-
-    Ok(projections)
-}
-
-fn push_call_projection(
-    projections: &mut Vec<String>,
-    state: &mut DisplayProjectionState,
-    source: &Value,
-    call_id: &str,
-    response_type: &str,
-    name: &str,
-    input: String,
-    status: Option<String>,
-) -> Result<()> {
-    if !state.call_ids.insert(call_id.to_string()) {
-        return Ok(());
-    }
-
-    let input_key = if response_type == "function_call" {
-        "arguments"
-    } else {
-        "input"
-    };
-    let mut payload = json!({
-        "type": response_type,
-        "name": name,
-        "call_id": call_id,
-        input_key: input,
-        "ucp_display_projection": true
-    });
-    if let Some(status) = status {
-        payload["status"] = Value::String(status);
-    }
-    projections.push(serde_json::to_string(&response_item_projection(
-        source, payload,
-    ))?);
-    Ok(())
-}
-
-fn push_output_projection(
-    projections: &mut Vec<String>,
-    state: &mut DisplayProjectionState,
-    source: &Value,
-    call_id: &str,
-    response_type: &str,
-    output: String,
-) -> Result<()> {
-    if !state.output_ids.insert(call_id.to_string()) {
-        return Ok(());
-    }
-    let payload = json!({
-        "type": response_type,
-        "call_id": call_id,
-        "output": output,
-        "ucp_display_projection": true
-    });
-    projections.push(serde_json::to_string(&response_item_projection(
-        source, payload,
-    ))?);
-    Ok(())
-}
-
-fn response_item_projection(source: &Value, payload: Value) -> Value {
-    let mut item = json!({
-        "type": "response_item",
-        "payload": payload
-    });
-    if let Some(timestamp) = source.get("timestamp").cloned() {
-        item["timestamp"] = timestamp;
-    }
-    item
-}
-
-fn event_call_id(payload: &Value) -> Option<String> {
-    payload
-        .get("call_id")
-        .or_else(|| payload.get("callId"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-}
-
-fn dynamic_tool_name(payload: &Value) -> Option<String> {
-    let tool = payload.get("tool").and_then(Value::as_str)?;
-    let namespace = payload
-        .get("namespace")
-        .and_then(Value::as_str)
-        .filter(|namespace| !namespace.is_empty());
-    Some(
-        namespace
-            .map(|namespace| format!("{namespace}.{tool}"))
-            .unwrap_or_else(|| tool.to_string()),
-    )
-}
-
-fn mcp_tool_name(invocation: &Value) -> String {
-    let tool = invocation
-        .get("tool")
-        .and_then(Value::as_str)
-        .unwrap_or("mcp_tool");
-    invocation
-        .get("server")
-        .and_then(Value::as_str)
-        .filter(|server| !server.is_empty())
-        .map(|server| format!("{server}.{tool}"))
-        .unwrap_or_else(|| tool.to_string())
-}
-
-fn exec_command_text(payload: &Value) -> Option<String> {
-    payload
-        .get("command")
-        .and_then(Value::as_array)
-        .and_then(|items| items.iter().rev().find_map(Value::as_str))
-        .map(ToString::to_string)
-        .or_else(|| {
-            payload
-                .get("cmd")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-}
-
-fn mcp_status(payload: &Value) -> Option<String> {
-    let result = payload.get("result")?;
-    if result.get("Ok").is_some() {
-        Some("completed".to_string())
-    } else if result.get("Err").is_some() {
-        Some("failed".to_string())
-    } else {
-        event_status(payload)
-    }
-}
-
-fn dynamic_status(payload: &Value) -> Option<String> {
-    event_status(payload).or_else(|| {
-        payload
-            .get("error")
-            .filter(|error| !error.is_null())
-            .map(|_| {
-                if payload.get("success").and_then(Value::as_bool) == Some(true) {
-                    "completed".to_string()
-                } else {
-                    "failed".to_string()
-                }
-            })
-    })
-}
-
-fn event_status(payload: &Value) -> Option<String> {
-    payload
-        .get("status")
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| {
-            payload
-                .get("success")
-                .and_then(Value::as_bool)
-                .map(|success| {
-                    if success {
-                        "completed".to_string()
-                    } else {
-                        "failed".to_string()
-                    }
-                })
-        })
-}
-
-fn dynamic_output(payload: &Value) -> Option<String> {
-    payload
-        .get("content_items")
-        .or_else(|| payload.get("error"))
-        .or_else(|| payload.get("result"))
-        .map(value_to_text)
-        .map(truncate_projection_output)
-}
-
-fn event_output_text(payload: &Value) -> Option<String> {
-    for key in ["aggregated_output", "formatted_output"] {
-        if let Some(text) = payload.get(key).map(value_to_text) {
-            if !text.is_empty() {
-                return Some(truncate_projection_output(text));
-            }
-        }
-    }
-
-    let mut parts = Vec::new();
-    for key in ["stdout", "stderr"] {
-        if let Some(text) = payload.get(key).map(value_to_text) {
-            if !text.is_empty() {
-                parts.push(text);
-            }
-        }
-    }
-    if parts.is_empty() {
-        payload
-            .get("output")
-            .or_else(|| payload.get("result"))
-            .map(value_to_text)
-            .map(truncate_projection_output)
-    } else {
-        Some(truncate_projection_output(parts.join("\n")))
-    }
-}
-
-fn truncate_projection_output(output: String) -> String {
-    const MAX_DISPLAY_PROJECTION_CHARS: usize = 8192;
-    if output.chars().nth(MAX_DISPLAY_PROJECTION_CHARS).is_none() {
-        return output;
-    }
-    let preview: String = output.chars().take(MAX_DISPLAY_PROJECTION_CHARS).collect();
-    format!("{preview}\n[truncated by ucp display projection]")
-}
-
-fn value_to_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        _ => serde_json::to_string(value).unwrap_or_default(),
-    }
 }
 
 fn rewrite_metadata_line(
@@ -1087,7 +783,11 @@ fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{process_session_file, process_session_metadata_file};
+    use super::{
+        normalize_tool_name, process_session_file, process_session_metadata_file,
+        repair_rollout_file,
+    };
+    use filetime::FileTime;
     use serde_json::Value;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1181,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn adds_idempotent_display_projections_for_top_level_events() {
+    fn metadata_sync_does_not_materialize_display_projections() {
         let root = temp_root();
         let _ = fs::remove_dir_all(&root);
         let backup_dir = root.join("backup");
@@ -1201,9 +901,8 @@ mod tests {
         .unwrap();
 
         let first = process_session_metadata_file(&path, "target", "gpt-5.5", &backup_dir).unwrap();
-        assert!(first.modified);
+        assert!(!first.modified);
         assert_eq!(first.lines_updated, 0);
-        assert_eq!(first.display_lines_added, 8);
 
         let content = fs::read_to_string(&path).unwrap();
         let rows: Vec<Value> = content
@@ -1216,27 +915,9 @@ mod tests {
                 .any(|row| row["type"] == "event_msg"
                     && row["payload"]["type"] == "mcp_tool_call_end")
         );
-        assert!(rows.iter().any(|row| row["type"] == "response_item"
-            && row["payload"]["ucp_display_projection"] == true
-            && row["payload"]["type"] == "custom_tool_call"
-            && row["payload"]["name"] == "codex_app.read_thread_terminal"));
-        assert!(rows.iter().any(|row| row["type"] == "response_item"
-            && row["payload"]["ucp_display_projection"] == true
-            && row["payload"]["type"] == "custom_tool_call_output"
-            && row["payload"]["call_id"] == "call_dynamic"
-            && row["payload"]["output"]
-                .as_str()
-                .is_some_and(|output| output.contains("deps loaded"))));
-        assert!(rows.iter().any(|row| row["type"] == "response_item"
-            && row["payload"]["ucp_display_projection"] == true
-            && row["payload"]["type"] == "function_call_output"
-            && row["payload"]["call_id"] == "call_stream"
-            && row["payload"]["output"] == "streamed output"));
-        assert!(rows.iter().any(|row| row["type"] == "response_item"
-            && row["payload"]["ucp_display_projection"] == true
-            && row["payload"]["type"] == "function_call_output"
-            && row["payload"]["call_id"] == "call_end"
-            && row["payload"]["output"] == "aggregated only"));
+        assert!(rows
+            .iter()
+            .all(|row| row["payload"]["ucp_display_projection"] != true));
 
         let second =
             process_session_metadata_file(&path, "target", "gpt-5.5", &backup_dir).unwrap();
@@ -1250,5 +931,70 @@ mod tests {
         assert_eq!(rows.len(), second_rows.len());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repairs_incompatible_tool_rows_with_backup_and_preserved_mtime() {
+        let root = temp_root();
+        let _ = fs::remove_dir_all(&root);
+        let backup_dir = root.join("backup");
+        let path = root.join("rollout-test.jsonl");
+        fs::create_dir_all(&root).unwrap();
+        let original = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"target\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"computer-use.click\",\"call_id\":\"projection-call\",\"input\":\"{}\",\"ucp_display_projection\":true}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"projection-call\",\"output\":\"ok\",\"ucp_display_projection\":true}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"computer-use.get_app_state\",\"call_id\":\"native-call\",\"input\":\"{}\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"native-call\",\"output\":\"ok\"}}\n",
+            "not json\n"
+        );
+        fs::write(&path, original).unwrap();
+        let original_mtime = FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(&path, original_mtime).unwrap();
+
+        let dry_run = repair_rollout_file(&path, &backup_dir, false).unwrap();
+        assert!(dry_run.affected);
+        assert_eq!(dry_run.projection_rows_removed, 2);
+        assert_eq!(dry_run.invalid_names_normalized, 1);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!backup_dir.exists());
+
+        let applied = repair_rollout_file(&path, &backup_dir, true).unwrap();
+        assert_eq!(applied, dry_run);
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("rollout-test.jsonl")).unwrap(),
+            original
+        );
+
+        let repaired = fs::read_to_string(&path).unwrap();
+        assert!(!repaired.contains("ucp_display_projection"));
+        assert!(repaired.contains("\"name\":\"computer-use_get_app_state\""));
+        assert!(repaired.contains("\"call_id\":\"native-call\""));
+        assert!(repaired.contains("not json"));
+        assert_eq!(
+            FileTime::from_last_modification_time(&fs::metadata(&path).unwrap()),
+            original_mtime
+        );
+
+        let second = repair_rollout_file(&path, &backup_dir, true).unwrap();
+        assert!(!second.affected);
+        assert_eq!(second.projection_rows_removed, 0);
+        assert_eq!(second.invalid_names_normalized, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalizes_tool_names_to_the_responses_api_character_set() {
+        assert_eq!(
+            normalize_tool_name("computer-use.click"),
+            "computer-use_click"
+        );
+        assert_eq!(
+            normalize_tool_name("btt::run javascript"),
+            "btt_run_javascript"
+        );
+        assert_eq!(normalize_tool_name("工具"), "legacy_tool");
+        assert_eq!(normalize_tool_name("already_valid-1"), "already_valid-1");
     }
 }

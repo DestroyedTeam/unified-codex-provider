@@ -74,7 +74,7 @@ pub fn switch_provider(profile_name: &str, rewrite_rollouts: bool) -> Result<()>
     println!("  Writing auth.json...");
     auth::write_auth(&profile, profile_name)?;
 
-    // 3. Unify session visibility. Rollout JSONL is append-only by default.
+    // 3. Unify session visibility with metadata-only rollout updates by default.
     println!("  Syncing session visibility...");
     let session_summary = sessions::unify_sessions(
         &profile.provider.model_provider,
@@ -176,7 +176,7 @@ pub fn auto_sync_with_options(rewrite_rollouts: bool) -> Result<()> {
         }
 
         // Reconcile the SQLite session index even when provider is unchanged.
-        // Rollout JSONL remains append-only unless explicitly requested.
+        // Rollout JSONL receives metadata-only updates unless explicitly requested.
         let matched_profile = provider::load_profile_by_name(profile_name)
             .ok()
             .or_else(|| {
