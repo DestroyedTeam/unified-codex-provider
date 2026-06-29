@@ -90,11 +90,10 @@ ucp remove old-profile
 `ucp switch` and `ucp sync` update only `session_meta` and `turn_context` rows
 inside historical `rollout-*.jsonl` files by default. Original tool calls,
 command outputs, assistant messages, and other event rows are left byte-for-byte
-unchanged. When a top-level low-level `event_msg` has no renderable
-`response_item`, UCP adds marked display projection rows next to the original
-event so local Codex history replay can show command/tool activity without
-destroying the source event. If you are intentionally repairing an old corrupted
-rollout and want the legacy full-file rewrite behavior, pass
+unchanged. UCP does not add synthetic display rows to rollout files because
+Codex can replay `response_item` rows as model input during context compaction.
+If you are intentionally repairing an old corrupted rollout and want the legacy
+full-file rewrite behavior, pass
 `--rewrite-rollouts`; UCP will back up matching rollout files and SQLite state
 files first.
 
@@ -104,9 +103,21 @@ files under both `sessions/` and `archived_sessions/`. The generated
 read-only audit index: they list recovered tool calls, command/cwd/exit status,
 rollout path, and source line references without rewriting the original
 rollout history. Command output is stored only as a bounded preview in the
-index and is not printed by default during switch/sync. UCP's audit index
-ignores its own marked display projection rows so the original low-level events
-remain the single source for recovered tool/command counts.
+index and is not printed by default during switch/sync.
+
+UCP 0.2.6 could add display-only response rows whose dotted tool names are
+rejected by newer Codex compaction validation. Scan safely first, then apply the
+surgical repair:
+
+```bash
+ucp repair-sessions
+ucp repair-sessions --apply
+```
+
+Dry-run is the default. Apply mode backs up each affected rollout, removes only
+UCP-marked display projection rows, normalizes invalid names on other historical
+tool-call rows, preserves call IDs/output pairing, and restores file modification
+times.
 
 ## Shell Completion
 
