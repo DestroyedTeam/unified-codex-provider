@@ -9,6 +9,7 @@ const LABEL: &str = "com.codex.unified-provider-sync";
 
 pub fn install_launch_agent() -> Result<()> {
     ensure_macos("installing the LaunchAgent")?;
+    let domain = launch_domain()?;
 
     let ucp_bin = std::env::current_exe().context("Cannot resolve current ucp executable")?;
     let home = home_dir()?;
@@ -26,15 +27,11 @@ pub fn install_launch_agent() -> Result<()> {
         fs::set_permissions(&plist_path, fs::Permissions::from_mode(0o600))?;
     }
 
-    bootout_launch_agent();
-    run_launchctl(&[
-        "bootstrap",
-        &launch_domain(),
-        &plist_path.display().to_string(),
-    ])
-    .context("Failed to load LaunchAgent")?;
-    run_launchctl(&["enable", &format!("{}/{}", launch_domain(), LABEL)])
-        .context("Failed to enable LaunchAgent")?;
+    bootout_launch_agent(&domain);
+    let target = format!("{domain}/{LABEL}");
+    run_launchctl(&["enable", &target]).context("Failed to enable LaunchAgent")?;
+    run_launchctl(&["bootstrap", &domain, &plist_path.display().to_string()])
+        .context("Failed to load LaunchAgent")?;
 
     println!("Installed LaunchAgent: {}", plist_path.display());
     Ok(())
@@ -42,8 +39,9 @@ pub fn install_launch_agent() -> Result<()> {
 
 pub fn uninstall_launch_agent() -> Result<()> {
     ensure_macos("uninstalling the LaunchAgent")?;
+    let domain = launch_domain()?;
 
-    bootout_launch_agent();
+    bootout_launch_agent(&domain);
     let plist = plist_path()?;
     if plist.exists() {
         fs::remove_file(&plist).with_context(|| format!("Cannot remove {}", plist.display()))?;
@@ -56,13 +54,14 @@ pub fn uninstall_launch_agent() -> Result<()> {
 
 pub fn show_launch_agent_status() -> Result<()> {
     ensure_macos("checking the LaunchAgent")?;
+    let domain = launch_domain()?;
 
     let plist = plist_path()?;
     println!("LaunchAgent: {}", LABEL);
     println!("Plist: {}", plist.display());
     println!("Installed: {}", if plist.exists() { "yes" } else { "no" });
 
-    let target = format!("{}/{}", launch_domain(), LABEL);
+    let target = format!("{domain}/{LABEL}");
     let output = Command::new("launchctl")
         .args(["print", &target])
         .output()?;
@@ -131,16 +130,26 @@ fn render_plist(ucp_bin: &PathBuf, home: &PathBuf) -> String {
     )
 }
 
-fn bootout_launch_agent() {
+fn bootout_launch_agent(domain: &str) {
     let _ = Command::new("launchctl")
-        .args(["bootout", &format!("{}/{}", launch_domain(), LABEL)])
-        .status();
+        .args(["bootout", &format!("{domain}/{LABEL}")])
+        .output();
 }
 
 fn run_launchctl(args: &[&str]) -> Result<()> {
-    let status = Command::new("launchctl").args(args).status()?;
-    if !status.success() {
-        bail!("launchctl {:?} exited with {}", args, status);
+    let output = Command::new("launchctl").args(args).output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            bail!("launchctl {:?} exited with {}", args, output.status);
+        }
+        bail!(
+            "launchctl {:?} exited with {}: {}",
+            args,
+            output.status,
+            detail
+        );
     }
     Ok(())
 }
@@ -156,19 +165,31 @@ fn home_dir() -> Result<PathBuf> {
     dirs::home_dir().context("Cannot determine home directory")
 }
 
-fn launch_domain() -> String {
-    format!("gui/{}", current_uid())
+fn launch_domain() -> Result<String> {
+    user_launch_domain(&current_uid()?)
 }
 
-fn current_uid() -> String {
-    Command::new("id")
+fn current_uid() -> Result<String> {
+    let output = Command::new("id")
         .arg("-u")
         .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .context("Cannot determine current user ID")?;
+    if !output.status.success() {
+        bail!("id -u exited with {}", output.status);
+    }
+    String::from_utf8(output.stdout)
+        .context("id -u returned invalid UTF-8")
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "0".to_string())
+}
+
+fn user_launch_domain(uid: &str) -> Result<String> {
+    if uid.is_empty() {
+        bail!("Cannot determine current user ID");
+    }
+    if uid == "0" {
+        bail!("LaunchAgents must be managed from the logged-in user session; do not use sudo");
+    }
+    Ok(format!("gui/{uid}"))
 }
 
 fn xml_escape(value: &str) -> String {
@@ -178,4 +199,20 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_launch_domain;
+
+    #[test]
+    fn launch_domain_uses_logged_in_user() {
+        assert_eq!(user_launch_domain("501").unwrap(), "gui/501");
+    }
+
+    #[test]
+    fn launch_domain_rejects_sudo_root() {
+        let error = user_launch_domain("0").unwrap_err().to_string();
+        assert!(error.contains("do not use sudo"));
+    }
 }

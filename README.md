@@ -164,6 +164,9 @@ ucp service status
 ucp service uninstall
 ```
 
+Run these commands as the logged-in macOS user, not with `sudo`; LaunchAgents
+belong to the user's `gui/<uid>` launchd domain.
+
 The LaunchAgent watches `~/.codex/auth.json` and `~/.codex/config.toml`, runs
 `ucp sync --auto --refresh-auth` at load and on file changes, and also wakes
 once per day through `StartInterval = 86400` as the token-refresh fallback. The
