@@ -99,6 +99,7 @@ fn render_plist(ucp_bin: &PathBuf, home: &PathBuf) -> String {
         <string>{ucp_bin}</string>
         <string>sync</string>
         <string>--auto</string>
+        <string>--refresh-auth</string>
     </array>
 
     <key>WatchPaths</key>
@@ -109,6 +110,9 @@ fn render_plist(ucp_bin: &PathBuf, home: &PathBuf) -> String {
 
     <key>RunAtLoad</key>
     <true/>
+
+    <key>StartInterval</key>
+    <integer>86400</integer>
 
     <key>StandardOutPath</key>
     <string>{home}/.codex/.ucp_sync_stdout.log</string>

@@ -20,12 +20,15 @@ visibility.
   Codex Desktop history replay omits them.
 - Detect duplicate ChatGPT auth snapshots that may cause
   `refresh_token_reused` failures.
+- Proactively refresh still-valid ChatGPT auth snapshots so inactive
+  subscription accounts do not silently age out.
 - Generate dynamic shell completion for Bash, Zsh, and Fish.
 - Optionally run auto-sync through a per-user macOS LaunchAgent.
 
 ## Requirements
 
-- Codex CLI available in `PATH` for `ucp login`.
+- Codex CLI available in `PATH` for `ucp login` and proactive ChatGPT auth
+  refresh.
 - macOS for auto-sync LaunchAgent support. Core CLI behavior is also tested on
   Linux.
 
@@ -105,6 +108,19 @@ rollout path, and source line references without rewriting the original
 rollout history. Command output is stored only as a bounded preview in the
 index and is not printed by default during switch/sync.
 
+
+Refresh stored ChatGPT subscription snapshots without switching accounts:
+
+```bash
+ucp refresh-auth
+```
+
+By default, UCP refreshes eligible ChatGPT snapshots that have not refreshed in
+at least 24 hours, using Codex itself inside an isolated temporary `CODEX_HOME`.
+Snapshots whose last refresh is older than 7 days are treated as historical
+stale accounts and skipped so they can be cleaned up or re-logged-in manually.
+Use `--force` only when you intentionally want to retry one of those snapshots.
+
 UCP 0.2.6 could add display-only response rows whose dotted tool names are
 rejected by newer Codex compaction validation. Scan safely first, then apply the
 surgical repair:
@@ -148,9 +164,11 @@ ucp service status
 ucp service uninstall
 ```
 
-The LaunchAgent watches `~/.codex/auth.json` and `~/.codex/config.toml`, then
-runs `ucp sync --auto`. The generated plist contains user-specific paths, so it
-is created locally and is not checked into the repository.
+The LaunchAgent watches `~/.codex/auth.json` and `~/.codex/config.toml`, runs
+`ucp sync --auto --refresh-auth` at load and on file changes, and also wakes
+once per day through `StartInterval = 86400` as the token-refresh fallback. The
+generated plist contains user-specific paths, so it is created locally and is
+not checked into the repository.
 
 ## Diagnostics
 

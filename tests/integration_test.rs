@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -148,6 +150,7 @@ fn test_help_output() {
     assert!(stdout.contains("doctor"));
     assert!(stdout.contains("service"));
     assert!(stdout.contains("repair-sessions"));
+    assert!(stdout.contains("refresh-auth"));
 }
 
 #[test]
@@ -763,4 +766,87 @@ fn test_zsh_completion_mentions_dynamic_profiles() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("#compdef ucp"));
     assert!(stdout.contains("ucp __complete profile"));
+}
+
+fn test_jwt(exp: i64) -> String {
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp},"iat":{}}}"#, exp - 3600));
+    format!("{header}.{payload}.sig")
+}
+
+fn write_chatgpt_auth(path: &Path, last_refresh: &str, exp: i64) {
+    let auth = serde_json::json!({
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "access_token": test_jwt(exp),
+            "id_token": test_jwt(exp),
+            "refresh_token": "test-refresh-token",
+            "account_id": "test-account"
+        },
+        "last_refresh": last_refresh
+    });
+    fs::write(path, serde_json::to_string_pretty(&auth).unwrap()).expect("write chatgpt auth");
+}
+
+#[test]
+fn test_refresh_auth_uses_codex_and_updates_active_snapshot() {
+    let home = temp_home("refresh_auth_test");
+    write_profile(&home, "openai");
+    let codex = home.join(".codex");
+    let providers = codex.join("providers");
+    let snapshot = providers.join("openai.auth.json");
+    write_chatgpt_auth(&snapshot, "2026-01-01T00:00:00Z", 1767229200);
+    write_chatgpt_auth(&codex.join("auth.json"), "2026-01-01T00:00:00Z", 1767229200);
+    fs::write(
+        codex.join(".ucp_state.json"),
+        r#"{"last_provider":"openai","last_profile_name":"openai","last_sync":"2026-01-01T00:00:00+00:00"}"#,
+    )
+    .expect("write state");
+
+    let fake_codex = home.join("fake-codex");
+    fs::write(
+        &fake_codex,
+        r#"#!/bin/sh
+python3 - "$CODEX_HOME/auth.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+data["last_refresh"] = "2099-01-01T00:00:00Z"
+open(path, "w").write(json.dumps(data, indent=2) + "\n")
+PY
+"#,
+    )
+    .expect("write fake codex");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .env("UCP_CODEX_BIN", &fake_codex)
+        .args(["refresh-auth", "--force", "openai"])
+        .output()
+        .expect("Failed to run refresh-auth");
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("refreshed"));
+    assert!(stdout.contains("Auth refresh: 1 scanned, 1 refreshed"));
+
+    let snapshot_auth: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&snapshot).unwrap()).unwrap();
+    let active_auth: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(codex.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(
+        snapshot_auth.get("last_refresh").and_then(|v| v.as_str()),
+        Some("2099-01-01T00:00:00Z")
+    );
+    assert_eq!(
+        active_auth.get("last_refresh").and_then(|v| v.as_str()),
+        Some("2099-01-01T00:00:00Z")
+    );
+
+    let _ = fs::remove_dir_all(&home);
 }

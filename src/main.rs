@@ -1,4 +1,5 @@
 mod auth;
+mod auth_refresh;
 mod config;
 mod history;
 mod migrate;
@@ -93,9 +94,32 @@ enum Commands {
     Sync {
         #[arg(long)]
         auto: bool,
+        /// Also refresh eligible stored ChatGPT auth snapshots
+        #[arg(long)]
+        refresh_auth: bool,
         /// Danger: full rewrite of historical rollout JSONL rows after backing them up
         #[arg(long)]
         rewrite_rollouts: bool,
+    },
+    /// Proactively refresh stored ChatGPT auth snapshots
+    RefreshAuth {
+        /// Refresh all registered profile snapshots (default when no name is provided)
+        #[arg(long)]
+        all: bool,
+        /// Specific profile name to refresh
+        name: Option<String>,
+        /// Refresh even if the snapshot is recent or very old
+        #[arg(long)]
+        force: bool,
+        /// Only print what would be refreshed
+        #[arg(long)]
+        dry_run: bool,
+        /// Minimum age before a healthy snapshot is refreshed
+        #[arg(long, default_value_t = 24)]
+        min_interval_hours: u64,
+        /// Skip snapshots older than this unless --force is used
+        #[arg(long, default_value_t = 7)]
+        max_stale_days: u64,
     },
     /// Run first-time setup checks and optional macOS auto-sync install
     Setup {
@@ -198,6 +222,7 @@ fn main() -> Result<()> {
         }
         Commands::Sync {
             auto,
+            refresh_auth,
             rewrite_rollouts,
         } => {
             warn_rollout_rewrite(rewrite_rollouts);
@@ -212,6 +237,32 @@ fn main() -> Result<()> {
                 sync::manual_sync(rewrite_rollouts)?;
                 println!("Sync complete.");
             }
+            if refresh_auth {
+                let summary = auth_refresh::refresh_auth_snapshots(
+                    auth_refresh::AuthRefreshOptions::default(),
+                )?;
+                auth_refresh::print_summary(&summary);
+            }
+        }
+        Commands::RefreshAuth {
+            all,
+            name,
+            force,
+            dry_run,
+            min_interval_hours,
+            max_stale_days,
+        } => {
+            let options = auth_refresh::AuthRefreshOptions {
+                profile_name: name,
+                all,
+                force,
+                dry_run,
+                min_interval_hours,
+                max_stale_days,
+                quiet: false,
+            };
+            let summary = auth_refresh::refresh_auth_snapshots(options)?;
+            auth_refresh::print_summary(&summary);
         }
         Commands::Setup { no_service } => {
             setup::run_setup(setup::SetupOptions {
@@ -418,7 +469,7 @@ const BASH_COMPLETION: &str = r#"_ucp()
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "status list switch remove delete rm add init import-auth login sync setup doctor service completions repair-sessions" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "status list switch remove delete rm add init import-auth login sync setup doctor service completions repair-sessions refresh-auth" -- "${cur}") )
         return 0
     fi
 
@@ -449,10 +500,13 @@ const BASH_COMPLETION: &str = r#"_ucp()
             COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") )
             ;;
         sync)
-            COMPREPLY=( $(compgen -W "--auto --rewrite-rollouts" -- "${cur}") )
+            COMPREPLY=( $(compgen -W "--auto --refresh-auth --rewrite-rollouts" -- "${cur}") )
             ;;
         repair-sessions)
             COMPREPLY=( $(compgen -W "--apply" -- "${cur}") )
+            ;;
+        refresh-auth)
+            COMPREPLY=( $(compgen -W "--all --force --dry-run --min-interval-hours --max-stale-days" -- "${cur}") )
             ;;
         setup)
             COMPREPLY=( $(compgen -W "--no-service" -- "${cur}") )
@@ -496,6 +550,7 @@ _ucp()
         'service:Manage macOS auto-sync service'
         'completions:Generate shell completion script'
         'repair-sessions:Scan or repair incompatible historical session rows'
+        'refresh-auth:Proactively refresh stored ChatGPT auth snapshots'
     )
 
     _arguments -C \
@@ -540,10 +595,19 @@ _ucp()
                 sync)
                     _arguments \
                         '--auto[Run LaunchAgent-style auto sync]' \
-                        '--rewrite-rollouts[Danger: full rewrite of historical rollout JSONL rows after backup]'
+                        '--rewrite-rollouts[Danger: full rewrite of historical rollout JSONL rows after backup]' \
+                        '--refresh-auth[Refresh eligible stored ChatGPT auth snapshots]'
                     ;;
                 repair-sessions)
                     _arguments '--apply[Back up affected rollouts and apply repairs]'
+                    ;;
+                refresh-auth)
+                    _arguments \
+                        '--all[Refresh all registered profile snapshots]' \
+                        '--force[Refresh even if recent or very old]' \
+                        '--dry-run[Only print what would be refreshed]' \
+                        '--min-interval-hours[Minimum age before refreshing]:hours:' \
+                        '--max-stale-days[Skip snapshots older than this]:days:'
                     ;;
                 setup)
                     _arguments '--no-service[Skip macOS LaunchAgent installation]'
@@ -591,6 +655,7 @@ complete -c ucp -n '__fish_is_first_arg' -a 'doctor' -d 'Diagnose local environm
 complete -c ucp -n '__fish_is_first_arg' -a 'service' -d 'Manage macOS auto-sync service'
 complete -c ucp -n '__fish_is_first_arg' -a 'completions' -d 'Generate shell completion script'
 complete -c ucp -n '__fish_is_first_arg' -a 'repair-sessions' -d 'Scan or repair incompatible historical session rows'
+complete -c ucp -n '__fish_is_first_arg' -a 'refresh-auth' -d 'Proactively refresh stored ChatGPT auth snapshots'
 complete -c ucp -n '__fish_seen_subcommand_from switch' -a '(ucp __complete profile (commandline -ct) 2>/dev/null)' -d 'Provider profile'
 complete -c ucp -n '__fish_seen_subcommand_from switch' -l rewrite-rollouts -d 'Danger: full rewrite of historical rollout JSONL rows after backup'
 complete -c ucp -n '__fish_seen_subcommand_from remove delete rm; and not string match -q -- "-*" (commandline -ct)' -a '(ucp __complete profile (commandline -ct) 2>/dev/null)' -d 'Provider profile'
@@ -600,8 +665,14 @@ complete -c ucp -n '__fish_seen_subcommand_from import-auth' -l all -d 'Import a
 complete -c ucp -n '__fish_seen_subcommand_from import-auth; and not string match -q -- "-*" (commandline -ct)' -a '(ucp __complete profile (commandline -ct) 2>/dev/null)' -d 'Provider profile'
 complete -c ucp -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
 complete -c ucp -n '__fish_seen_subcommand_from sync' -l auto -d 'Run LaunchAgent-style auto sync'
+complete -c ucp -n '__fish_seen_subcommand_from sync' -l refresh-auth -d 'Refresh eligible stored ChatGPT auth snapshots'
 complete -c ucp -n '__fish_seen_subcommand_from sync' -l rewrite-rollouts -d 'Danger: full rewrite of historical rollout JSONL rows after backup'
 complete -c ucp -n '__fish_seen_subcommand_from repair-sessions' -l apply -d 'Back up affected rollouts and apply repairs'
+complete -c ucp -n '__fish_seen_subcommand_from refresh-auth' -l all -d 'Refresh all registered profile snapshots'
+complete -c ucp -n '__fish_seen_subcommand_from refresh-auth' -l force -d 'Refresh even if recent or very old'
+complete -c ucp -n '__fish_seen_subcommand_from refresh-auth' -l dry-run -d 'Only print what would be refreshed'
+complete -c ucp -n '__fish_seen_subcommand_from refresh-auth' -l min-interval-hours -d 'Minimum age before refreshing'
+complete -c ucp -n '__fish_seen_subcommand_from refresh-auth' -l max-stale-days -d 'Skip snapshots older than this'
 complete -c ucp -n '__fish_seen_subcommand_from setup' -l no-service -d 'Skip macOS LaunchAgent installation'
 complete -c ucp -n '__fish_seen_subcommand_from service' -a 'install status uninstall'
 complete -c ucp -n '__fish_seen_subcommand_from login' -l name -d 'Profile name' -r

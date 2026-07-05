@@ -1,6 +1,6 @@
 [package]
 name = "unified-codex-provider"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 description = "Unified provider switching and config sync for Codex"
 license = "MIT"
@@ -23,6 +23,7 @@ toml_edit = "0.22"
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
+base64 = "0.22"
 dirs = "5.0"
 walkdir = "2.5"
 fs2 = "0.4"
