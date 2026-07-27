@@ -38,14 +38,11 @@ struct DbUpdateSummary {
 
 /// Unify session visibility for the given model_provider and model.
 ///
-/// By default only rollout metadata rows are rewritten: `session_meta` carries
-/// the provider identity and `turn_context` carries the model. Tool calls,
-/// command outputs, assistant messages, and other event rows remain byte-for-
-/// byte unchanged. Tool/event rendering belongs in the separate history audit
-/// index; adding synthetic response items to rollout files can cause those
-/// display-only rows to be replayed as model input. A full rollout rewrite is
-/// still available as an explicit recovery operation through
-/// `SessionSyncOptions::full_rollout_rewrite`.
+/// By default raw rollout JSONL is never touched: Codex Desktop session
+/// visibility is reconciled through its SQLite thread index instead. This keeps
+/// switches proportional to the small state database rather than the full
+/// historical transcript corpus. A full rollout rewrite remains an explicit
+/// recovery operation through `SessionSyncOptions::full_rollout_rewrite`.
 pub fn unify_sessions(
     target_provider: &str,
     target_model: &str,
@@ -60,16 +57,10 @@ pub fn unify_sessions(
         println!(
             "  Warning: full rollout JSONL rewrite enabled; originals will be backed up first."
         );
+        sync_rollout_files(target_provider, target_model, &backup_dir, &mut summary);
     } else {
-        println!("  Rollout JSONL: syncing metadata rows only; event/tool rows stay unchanged.");
+        println!("  Rollout JSONL: left unchanged; reconciling the SQLite thread index only.");
     }
-    sync_rollout_files(
-        target_provider,
-        target_model,
-        &backup_dir,
-        options.full_rollout_rewrite,
-        &mut summary,
-    );
 
     match update_sessions_db(target_provider, target_model, &backup_dir) {
         Ok(db_summary) => {
@@ -96,18 +87,32 @@ pub fn unify_sessions(
             backup_dir.display()
         );
     }
-    match history::refresh_history_index() {
+    match history::refresh_history_index_with_options(options.full_rollout_rewrite) {
         Ok(history_summary) => {
             summary.history_rollouts_scanned = history_summary.rollouts_scanned;
             summary.history_tool_calls_indexed = history_summary.tool_calls_indexed;
             summary.history_command_executions_indexed = history_summary.command_executions_indexed;
             summary.history_errors = history_summary.errors;
-            println!(
-                "  History index: {} rollout(s), {} tool call(s), {} command execution(s)",
-                summary.history_rollouts_scanned,
-                summary.history_tool_calls_indexed,
-                summary.history_command_executions_indexed
-            );
+            if history_summary.index_reused {
+                if history_summary.index_sources_changed {
+                    println!(
+                        "  History index: source changes deferred; reused {} rollout(s) without reading rollout content (run `ucp rebuild-history` to refresh)",
+                        summary.history_rollouts_scanned
+                    );
+                } else {
+                    println!(
+                        "  History index: unchanged sources; reused {} rollout(s) without reading rollout content",
+                        summary.history_rollouts_scanned
+                    );
+                }
+            } else {
+                println!(
+                    "  History index: {} rollout(s), {} tool call(s), {} command execution(s)",
+                    summary.history_rollouts_scanned,
+                    summary.history_tool_calls_indexed,
+                    summary.history_command_executions_indexed
+                );
+            }
         }
         Err(e) => {
             eprintln!("  Warning: failed to refresh history index: {}", e);
@@ -158,7 +163,6 @@ fn sync_rollout_files(
     target_provider: &str,
     target_model: &str,
     backup_dir: &Path,
-    full_rewrite: bool,
     summary: &mut SessionSyncSummary,
 ) {
     for root_name in ["sessions", "archived_sessions"] {
@@ -177,11 +181,7 @@ fn sync_rollout_files(
                 continue;
             }
 
-            let result = if full_rewrite {
-                process_session_file(path, target_provider, target_model, backup_dir)
-            } else {
-                process_session_metadata_file(path, target_provider, target_model, backup_dir)
-            };
+            let result = process_session_file(path, target_provider, target_model, backup_dir);
 
             match result {
                 Ok(ProcessSessionFileResult {
@@ -376,12 +376,10 @@ fn normalize_tool_name(name: &str) -> String {
     }
 }
 
-/// Process a single session file using the legacy full rewrite behavior.
+/// Process a single session file during an explicit full-rollout recovery.
 ///
-/// This rewrites every parsed JSON line and is intentionally reserved for
-/// explicit recovery workflows. Normal switch/sync uses
-/// `process_session_metadata_file` so tool calls and command output rows remain
-/// byte-for-byte unchanged.
+/// This rewrites every parsed JSON line and is intentionally never used by a
+/// normal switch or auto-sync.
 fn process_session_file(
     path: &Path,
     target_provider: &str,
@@ -430,77 +428,6 @@ fn process_session_file(
         modified: true,
         lines_updated,
     })
-}
-
-/// Process a single session file by rewriting only metadata JSONL rows.
-fn process_session_metadata_file(
-    path: &Path,
-    target_provider: &str,
-    target_model: &str,
-    backup_dir: &Path,
-) -> Result<ProcessSessionFileResult> {
-    let content = fs::read_to_string(path)?;
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.is_empty() {
-        return Ok(ProcessSessionFileResult::default());
-    }
-
-    let mut changed = false;
-    let mut lines_updated = 0usize;
-    let mut new_lines: Vec<String> = Vec::with_capacity(lines.len());
-
-    for line in lines.iter() {
-        let Some(updated) = rewrite_metadata_line(line, target_provider, target_model)? else {
-            new_lines.push(line.to_string());
-            continue;
-        };
-        changed = true;
-        lines_updated += 1;
-        new_lines.push(updated);
-    }
-
-    if !changed {
-        return Ok(ProcessSessionFileResult::default());
-    }
-
-    backup_session_file(path, backup_dir)?;
-    write_session_content_preserving_mtime(path, &content, new_lines)?;
-
-    Ok(ProcessSessionFileResult {
-        modified: true,
-        lines_updated,
-    })
-}
-
-fn rewrite_metadata_line(
-    line: &str,
-    target_provider: &str,
-    target_model: &str,
-) -> Result<Option<String>> {
-    if !line.contains("\"session_meta\"") && !line.contains("\"turn_context\"") {
-        return Ok(None);
-    }
-
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
-        return Ok(None);
-    };
-    let Some(record_type) = value.get("type").and_then(|v| v.as_str()) else {
-        return Ok(None);
-    };
-    if record_type != "session_meta" && record_type != "turn_context" {
-        return Ok(None);
-    }
-
-    let needs_update = payload_needs_update(&value, target_provider, target_model);
-    if !needs_update {
-        return Ok(None);
-    }
-
-    if let Some(obj) = value.get_mut("payload").and_then(|p| p.as_object_mut()) {
-        update_payload(obj, target_provider, target_model);
-    }
-
-    Ok(Some(serde_json::to_string(&value)?))
 }
 
 fn payload_needs_update(
@@ -783,10 +710,7 @@ fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        normalize_tool_name, process_session_file, process_session_metadata_file,
-        repair_rollout_file,
-    };
+    use super::{normalize_tool_name, process_session_file, repair_rollout_file};
     use filetime::FileTime;
     use serde_json::Value;
     use std::fs;
@@ -876,59 +800,6 @@ mod tests {
             rows[1]["payload"]["collaboration_mode"]["settings"]["model"],
             "gpt-5.5"
         );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn metadata_sync_does_not_materialize_display_projections() {
-        let root = temp_root();
-        let _ = fs::remove_dir_all(&root);
-        let backup_dir = root.join("backup");
-        fs::create_dir_all(&backup_dir).unwrap();
-        let path = root.join("rollout-test.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"target\",\"model\":\"gpt-5.5\"}}\n",
-                "{\"timestamp\":\"2026-06-14T01:02:08Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"mcp_tool_call_end\",\"call_id\":\"call_mcp\",\"invocation\":{\"server\":\"codex_app\",\"tool\":\"read_thread_terminal\",\"arguments\":{\"limit\":10}},\"result\":{\"Ok\":\"terminal output\"}}}\n",
-                "{\"timestamp\":\"2026-06-14T01:02:10Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"dynamic_tool_call_request\",\"callId\":\"call_dynamic\",\"namespace\":\"codex_app\",\"tool\":\"load_workspace_dependencies\",\"arguments\":{\"include\":\"runtime\"}}}\n",
-                "{\"timestamp\":\"2026-06-14T01:02:11Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"dynamic_tool_call_response\",\"call_id\":\"call_dynamic\",\"tool\":\"load_workspace_dependencies\",\"success\":true,\"content_items\":[{\"text\":\"deps loaded\"}]}}\n",
-                "{\"timestamp\":\"2026-06-14T01:02:13Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"exec_command_output\",\"call_id\":\"call_stream\",\"stdout\":\"streamed output\"}}\n",
-                "{\"timestamp\":\"2026-06-14T01:02:14Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"exec_command_end\",\"call_id\":\"call_end\",\"command\":[\"/bin/zsh\",\"-lc\",\"printf done\"],\"aggregated_output\":\"aggregated only\",\"formatted_output\":\"formatted duplicate\",\"status\":\"completed\"}}\n"
-            ),
-        )
-        .unwrap();
-
-        let first = process_session_metadata_file(&path, "target", "gpt-5.5", &backup_dir).unwrap();
-        assert!(!first.modified);
-        assert_eq!(first.lines_updated, 0);
-
-        let content = fs::read_to_string(&path).unwrap();
-        let rows: Vec<Value> = content
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-
-        assert!(
-            rows.iter()
-                .any(|row| row["type"] == "event_msg"
-                    && row["payload"]["type"] == "mcp_tool_call_end")
-        );
-        assert!(rows
-            .iter()
-            .all(|row| row["payload"]["ucp_display_projection"] != true));
-
-        let second =
-            process_session_metadata_file(&path, "target", "gpt-5.5", &backup_dir).unwrap();
-        assert!(!second.modified);
-
-        let second_rows: Vec<Value> = fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(rows.len(), second_rows.len());
 
         let _ = fs::remove_dir_all(&root);
     }

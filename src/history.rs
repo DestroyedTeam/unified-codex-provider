@@ -2,10 +2,11 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
 use crate::config::codex_dir;
@@ -14,6 +15,8 @@ const HISTORY_DIR: &str = ".ucp_history";
 const TOOL_CALLS_FILE: &str = "tool_calls.jsonl";
 const COMMAND_EXECUTIONS_FILE: &str = "command_executions.jsonl";
 const SUMMARY_FILE: &str = "summary.json";
+const MANIFEST_FILE: &str = "sources.json";
+const HISTORY_INDEX_VERSION: u32 = 1;
 const DEFAULT_PREVIEW_CHARS: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -29,6 +32,31 @@ pub struct HistoryIndexSummary {
     pub output_previews_indexed: usize,
     pub errors: usize,
     pub index_dir: String,
+    #[serde(default)]
+    pub index_reused: bool,
+    #[serde(default)]
+    pub index_sources_changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HistoryIndexManifest {
+    version: u32,
+    sources: BTreeMap<String, SourceFingerprint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SourceFingerprint {
+    size: u64,
+    modified_secs: i64,
+    modified_nanos: u32,
+}
+
+#[derive(Debug, Clone)]
+struct RolloutSource {
+    path: PathBuf,
+    root_name: &'static str,
+    relative_path: String,
+    fingerprint: SourceFingerprint,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,23 +150,43 @@ struct ExecEvent {
 /// The raw rollout files remain the source of truth. This index exists so UCP
 /// can recover command/tool history even when Codex Desktop history replay omits
 /// low-level command execution items.
-pub fn refresh_history_index() -> Result<HistoryIndexSummary> {
-    refresh_history_index_with_preview(DEFAULT_PREVIEW_CHARS)
+pub fn refresh_history_index_with_options(force_rebuild: bool) -> Result<HistoryIndexSummary> {
+    refresh_history_index_with_preview(DEFAULT_PREVIEW_CHARS, force_rebuild)
 }
 
-fn refresh_history_index_with_preview(preview_chars: usize) -> Result<HistoryIndexSummary> {
+fn refresh_history_index_with_preview(
+    preview_chars: usize,
+    force_rebuild: bool,
+) -> Result<HistoryIndexSummary> {
     let base = codex_dir();
     let index_dir = base.join(HISTORY_DIR);
-    refresh_history_index_at(&base, &index_dir, preview_chars)
+    refresh_history_index_at_with_options(&base, &index_dir, preview_chars, force_rebuild)
 }
 
+#[cfg(test)]
 fn refresh_history_index_at(
     codex_home: &Path,
     index_dir: &Path,
     preview_chars: usize,
 ) -> Result<HistoryIndexSummary> {
+    refresh_history_index_at_with_options(codex_home, index_dir, preview_chars, false)
+}
+
+fn refresh_history_index_at_with_options(
+    codex_home: &Path,
+    index_dir: &Path,
+    preview_chars: usize,
+    force_rebuild: bool,
+) -> Result<HistoryIndexSummary> {
     fs::create_dir_all(index_dir)
         .with_context(|| format!("Failed to create {}", index_dir.display()))?;
+
+    let sources = collect_rollout_sources(codex_home)?;
+    if !force_rebuild {
+        if let Some(summary) = reuse_history_index_if_current(index_dir, &sources)? {
+            return Ok(summary);
+        }
+    }
 
     let tool_tmp = index_dir.join(format!("{TOOL_CALLS_FILE}.tmp"));
     let exec_tmp = index_dir.join(format!("{COMMAND_EXECUTIONS_FILE}.tmp"));
@@ -157,6 +205,47 @@ fn refresh_history_index_at(
         ..HistoryIndexSummary::default()
     };
 
+    for source in &sources {
+        summary.rollouts_scanned += 1;
+        if source.root_name == "sessions" {
+            summary.live_rollouts += 1;
+        } else {
+            summary.archived_rollouts += 1;
+        }
+
+        if let Err(err) = index_rollout_file(
+            codex_home,
+            &source.path,
+            preview_chars,
+            &mut tool_writer,
+            &mut exec_writer,
+            &mut summary,
+        ) {
+            summary.errors += 1;
+            eprintln!(
+                "  Warning: failed to index history {}: {}",
+                source.path.display(),
+                err
+            );
+        }
+    }
+
+    tool_writer.flush()?;
+    exec_writer.flush()?;
+
+    let summary_content = serde_json::to_string_pretty(&summary)?;
+    fs::write(&summary_tmp, summary_content)?;
+
+    fs::rename(&tool_tmp, index_dir.join(TOOL_CALLS_FILE))?;
+    fs::rename(&exec_tmp, index_dir.join(COMMAND_EXECUTIONS_FILE))?;
+    fs::rename(&summary_tmp, index_dir.join(SUMMARY_FILE))?;
+    write_manifest(index_dir, &sources)?;
+
+    Ok(summary)
+}
+
+fn collect_rollout_sources(codex_home: &Path) -> Result<Vec<RolloutSource>> {
+    let mut sources = Vec::new();
     for root_name in ["sessions", "archived_sessions"] {
         let root = codex_home.join(root_name);
         if !root.exists() {
@@ -171,43 +260,106 @@ fn refresh_history_index_at(
             if !is_rollout_file(path) {
                 continue;
             }
-
-            summary.rollouts_scanned += 1;
-            if root_name == "sessions" {
-                summary.live_rollouts += 1;
-            } else {
-                summary.archived_rollouts += 1;
-            }
-
-            if let Err(err) = index_rollout_file(
-                codex_home,
-                path,
-                preview_chars,
-                &mut tool_writer,
-                &mut exec_writer,
-                &mut summary,
-            ) {
-                summary.errors += 1;
-                eprintln!(
-                    "  Warning: failed to index history {}: {}",
-                    path.display(),
-                    err
-                );
-            }
+            let metadata =
+                fs::metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?;
+            let relative_path = relative_path(codex_home, path);
+            sources.push(RolloutSource {
+                path: path.to_path_buf(),
+                root_name,
+                relative_path,
+                fingerprint: SourceFingerprint::from_metadata(&metadata),
+            });
         }
     }
+    sources.sort_by(|left, right| {
+        let left_root = usize::from(left.root_name != "sessions");
+        let right_root = usize::from(right.root_name != "sessions");
+        left_root
+            .cmp(&right_root)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    Ok(sources)
+}
 
-    tool_writer.flush()?;
-    exec_writer.flush()?;
+impl SourceFingerprint {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let duration = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
+        Self {
+            size: metadata.len(),
+            modified_secs: duration.as_secs().try_into().unwrap_or(i64::MAX),
+            modified_nanos: duration.subsec_nanos(),
+        }
+    }
+}
 
-    let summary_content = serde_json::to_string_pretty(&summary)?;
-    fs::write(&summary_tmp, summary_content)?;
+fn source_manifest(sources: &[RolloutSource]) -> HistoryIndexManifest {
+    HistoryIndexManifest {
+        version: HISTORY_INDEX_VERSION,
+        sources: sources
+            .iter()
+            .map(|source| (source.relative_path.clone(), source.fingerprint.clone()))
+            .collect(),
+    }
+}
 
-    fs::rename(&tool_tmp, index_dir.join(TOOL_CALLS_FILE))?;
-    fs::rename(&exec_tmp, index_dir.join(COMMAND_EXECUTIONS_FILE))?;
-    fs::rename(&summary_tmp, index_dir.join(SUMMARY_FILE))?;
+fn reuse_history_index_if_current(
+    index_dir: &Path,
+    sources: &[RolloutSource],
+) -> Result<Option<HistoryIndexSummary>> {
+    let summary_path = index_dir.join(SUMMARY_FILE);
+    let tool_calls_path = index_dir.join(TOOL_CALLS_FILE);
+    let command_executions_path = index_dir.join(COMMAND_EXECUTIONS_FILE);
+    if !summary_path.exists() || !tool_calls_path.exists() || !command_executions_path.exists() {
+        return Ok(None);
+    }
 
-    Ok(summary)
+    let summary: HistoryIndexSummary = match fs::read_to_string(&summary_path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+    {
+        Some(summary) => summary,
+        None => return Ok(None),
+    };
+    let expected_manifest = source_manifest(sources);
+    let manifest_path = index_dir.join(MANIFEST_FILE);
+    let mut index_sources_changed = false;
+    if manifest_path.exists() {
+        let manifest = fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok())
+            .filter(|manifest: &HistoryIndexManifest| manifest == &expected_manifest);
+        if manifest.is_none() {
+            // The audit index is intentionally refreshed only on an explicit
+            // rebuild. A profile switch must stay bounded even when Codex has
+            // appended to a multi-gigabyte live rollout in the meantime.
+            write_manifest(index_dir, sources)?;
+            index_sources_changed = true;
+        }
+    } else {
+        // Older UCP releases produced the same aggregate index but no source
+        // manifest. Adopt it as the baseline without rereading the transcript
+        // corpus; the manifest catches every source change from this point on.
+        write_manifest(index_dir, sources)?;
+        index_sources_changed = true;
+    }
+
+    Ok(Some(HistoryIndexSummary {
+        index_reused: true,
+        index_sources_changed,
+        ..summary
+    }))
+}
+
+fn write_manifest(index_dir: &Path, sources: &[RolloutSource]) -> Result<()> {
+    let manifest_path = index_dir.join(MANIFEST_FILE);
+    let manifest_tmp = index_dir.join(format!("{MANIFEST_FILE}.tmp"));
+    fs::write(
+        &manifest_tmp,
+        serde_json::to_string_pretty(&source_manifest(sources))?,
+    )?;
+    fs::rename(manifest_tmp, manifest_path)?;
+    Ok(())
 }
 
 fn index_rollout_file(
@@ -1236,6 +1388,8 @@ mod tests {
                 output_previews_indexed: 5,
                 errors: 0,
                 index_dir: ".ucp_history".to_string(),
+                index_reused: false,
+                index_sources_changed: false,
             }
         );
 
@@ -1287,6 +1441,72 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(index_dir.join("summary.json")).unwrap())
                 .unwrap();
         assert_eq!(summary_json.command_executions_indexed, 3);
+
+        let reused = refresh_history_index_at(&codex, &index_dir, 32).unwrap();
+        assert!(reused.index_reused);
+        assert_eq!(reused.json_lines_read, summary.json_lines_read);
+
+        fs::write(
+            sessions.join("rollout-2026-06-14T01-02-03-thread-live.jsonl"),
+            "a changed rollout must not trigger a full automatic rebuild\n",
+        )
+        .unwrap();
+        let deferred = refresh_history_index_at(&codex, &index_dir, 32).unwrap();
+        assert!(deferred.index_reused);
+        assert!(deferred.index_sources_changed);
+        assert_eq!(deferred.json_lines_read, summary.json_lines_read);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adopts_a_legacy_index_even_when_a_rollout_changed_since_its_last_build() {
+        let root = temp_root();
+        let codex = root.join(".codex");
+        let sessions = codex.join("sessions");
+        let index_dir = codex.join(".ucp_history");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&index_dir).unwrap();
+
+        fs::write(index_dir.join("tool_calls.jsonl"), "existing tool index\n").unwrap();
+        fs::write(
+            index_dir.join("command_executions.jsonl"),
+            "existing execution index\n",
+        )
+        .unwrap();
+
+        let existing = HistoryIndexSummary {
+            generated_at: "2026-06-14T01:02:03Z".to_string(),
+            rollouts_scanned: 1,
+            live_rollouts: 1,
+            archived_rollouts: 0,
+            json_lines_read: 42,
+            malformed_lines: 0,
+            tool_calls_indexed: 7,
+            command_executions_indexed: 3,
+            output_previews_indexed: 2,
+            errors: 0,
+            index_dir: ".ucp_history".to_string(),
+            index_reused: false,
+            index_sources_changed: false,
+        };
+        fs::write(
+            index_dir.join("summary.json"),
+            serde_json::to_string(&existing).unwrap(),
+        )
+        .unwrap();
+
+        fs::write(
+            sessions.join("rollout-2026-06-14T01-02-03-thread-live.jsonl"),
+            "this source must not be parsed while adopting the legacy index\n",
+        )
+        .unwrap();
+
+        let reused = refresh_history_index_at(&codex, &index_dir, 32).unwrap();
+        assert!(reused.index_reused);
+        assert_eq!(reused.json_lines_read, 42);
+        assert!(reused.index_sources_changed);
+        assert!(index_dir.join("sources.json").exists());
 
         let _ = fs::remove_dir_all(&root);
     }

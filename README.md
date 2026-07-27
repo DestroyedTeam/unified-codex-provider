@@ -12,12 +12,10 @@ visibility.
 - Keep provider-specific profiles separate from shared Codex configuration.
 - Preserve full ChatGPT authentication snapshots, including refreshed tokens.
 - Switch between native OpenAI accounts, API-key providers, and proxies.
-- Reconcile Codex session metadata and database indexes so historical sessions
-  remain visible across provider switches without touching tool call/output
-  rows.
-- Build a local read-only history audit index from raw rollout JSONL on every
-  switch/sync, so command executions and tool calls remain inspectable even if
-  Codex Desktop history replay omits them.
+- Reconcile Codex's SQLite session index so historical sessions remain visible
+  across provider switches without rewriting raw rollout JSONL.
+- Keep a local read-only history audit index from raw rollout JSONL without
+  rescanning the historical corpus during ordinary switches.
 - Detect duplicate ChatGPT auth snapshots that may cause
   `refresh_token_reused` failures.
 - Proactively refresh still-valid ChatGPT auth snapshots so inactive
@@ -90,18 +88,27 @@ ucp status
 ucp remove old-profile
 ```
 
-`ucp switch` and `ucp sync` update only `session_meta` and `turn_context` rows
-inside historical `rollout-*.jsonl` files by default. Original tool calls,
-command outputs, assistant messages, and other event rows are left byte-for-byte
-unchanged. UCP does not add synthetic display rows to rollout files because
-Codex can replay `response_item` rows as model input during context compaction.
-If you are intentionally repairing an old corrupted rollout and want the legacy
-full-file rewrite behavior, pass
+`ucp switch` and `ucp sync` leave historical `rollout-*.jsonl` files byte-for-byte
+unchanged by default and reconcile the SQLite thread index instead. UCP does not
+add synthetic display rows to rollout files because Codex can replay
+`response_item` rows as model input during context compaction. If you are
+intentionally repairing an old corrupted rollout and want the legacy full-file
+rewrite behavior, pass
 `--rewrite-rollouts`; UCP will back up matching rollout files and SQLite state
 files first.
 
-Every switch/sync also refreshes `~/.codex/.ucp_history/` from the raw rollout
-files under both `sessions/` and `archived_sessions/`. The generated
+Every switch/sync checks `~/.codex/.ucp_history/` against the raw rollout files
+under both `sessions/` and `archived_sessions/`. It reuses the existing index
+without reading rollout content, including when sources changed; the command
+prints that the audit index is stale in that case. On upgrade, an existing index
+is adopted as the initial baseline without rereading the corpus. Refresh the
+audit index explicitly when needed:
+
+```bash
+ucp rebuild-history
+```
+
+The generated
 `tool_calls.jsonl`, `command_executions.jsonl`, and `summary.json` files are a
 read-only audit index: they list recovered tool calls, command/cwd/exit status,
 rollout path, and source line references without rewriting the original

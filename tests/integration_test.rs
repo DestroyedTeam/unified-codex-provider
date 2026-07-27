@@ -150,6 +150,7 @@ fn test_help_output() {
     assert!(stdout.contains("doctor"));
     assert!(stdout.contains("service"));
     assert!(stdout.contains("repair-sessions"));
+    assert!(stdout.contains("rebuild-history"));
     assert!(stdout.contains("refresh-auth"));
 }
 
@@ -265,7 +266,7 @@ fn test_switch_nonexistent_profile() {
 }
 
 #[test]
-fn test_switch_syncs_rollout_metadata_only_by_default_and_updates_db() {
+fn test_switch_leaves_rollouts_untouched_by_default_and_updates_db() {
     let home = temp_home("switch_rollout_metadata_only");
     write_profile(&home, "target");
     let codex = home.join(".codex");
@@ -300,21 +301,12 @@ fn test_switch_syncs_rollout_metadata_only_by_default_and_updates_db() {
         .expect("Failed to run ucp switch");
 
     assert_success(&output);
-    let rows = parse_jsonl(&rollout);
-    assert_eq!(rows[0]["payload"]["model_provider"], "target");
-    assert_eq!(rows[1]["payload"]["model"], "gpt-5.5");
-    assert_eq!(
-        rows[1]["payload"]["collaboration_mode"]["settings"]["model"],
-        "gpt-5.5"
-    );
     let new_lines: Vec<String> = fs::read_to_string(&rollout)
         .unwrap()
         .lines()
         .map(ToString::to_string)
         .collect();
-    assert_eq!(new_lines[2], original_lines[2]);
-    assert_eq!(new_lines[3], original_lines[3]);
-    assert_eq!(new_lines.len(), original_lines.len());
+    assert_eq!(new_lines, original_lines);
     assert_eq!(
         read_thread_model(&db_path),
         (Some("target".to_string()), Some("gpt-5.5".to_string()))
@@ -326,9 +318,9 @@ fn test_switch_syncs_rollout_metadata_only_by_default_and_updates_db() {
         .any(|dir| dir.join("state_5.sqlite").exists()));
     assert!(backups
         .iter()
-        .any(|dir| dir.join("sessions").join("rollout-test.jsonl").exists()));
+        .all(|dir| !dir.join("sessions").join("rollout-test.jsonl").exists()));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("metadata rows only"));
+    assert!(stdout.contains("left unchanged"));
 
     let _ = fs::remove_dir_all(&home);
 }
@@ -486,7 +478,7 @@ fn test_repair_sessions_dry_run_then_apply_with_backup() {
 }
 
 #[test]
-fn test_sync_updates_dual_sqlite_paths_and_live_archived_rollout_metadata() {
+fn test_sync_updates_dual_sqlite_paths_without_rewriting_live_or_archived_rollouts() {
     let home = temp_home("sync_dual_db_metadata");
     write_profile(&home, "target");
     let codex = home.join(".codex");
@@ -499,19 +491,15 @@ fn test_sync_updates_dual_sqlite_paths_and_live_archived_rollout_metadata() {
     let sessions = codex.join("sessions");
     fs::create_dir_all(&sessions).expect("create sessions dir");
     let rollout = sessions.join("rollout-test.jsonl");
-    fs::write(
-        &rollout,
-        "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}\n",
-    )
-    .expect("write rollout");
+    let rollout_content =
+        "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}\n";
+    fs::write(&rollout, rollout_content).expect("write rollout");
     let archived = codex.join("archived_sessions");
     fs::create_dir_all(&archived).expect("create archived sessions dir");
     let archived_rollout = archived.join("rollout-archived.jsonl");
-    fs::write(
-        &archived_rollout,
-        "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}\n",
-    )
-    .expect("write archived rollout");
+    let archived_rollout_content =
+        "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"old\",\"model\":\"gpt-5.4\"}}\n";
+    fs::write(&archived_rollout, archived_rollout_content).expect("write archived rollout");
 
     let legacy_db = codex.join("state_5.sqlite");
     let new_db = codex.join("sqlite").join("state_5.sqlite");
@@ -525,13 +513,10 @@ fn test_sync_updates_dual_sqlite_paths_and_live_archived_rollout_metadata() {
         .expect("Failed to run ucp sync");
 
     assert_success(&output);
+    assert_eq!(fs::read_to_string(&rollout).unwrap(), rollout_content);
     assert_eq!(
-        parse_jsonl(&rollout)[0]["payload"]["model_provider"],
-        "target"
-    );
-    assert_eq!(
-        parse_jsonl(&archived_rollout)[0]["payload"]["model_provider"],
-        "target"
+        fs::read_to_string(&archived_rollout).unwrap(),
+        archived_rollout_content
     );
     assert_eq!(
         read_thread_model(&legacy_db),
@@ -551,11 +536,12 @@ fn test_sync_updates_dual_sqlite_paths_and_live_archived_rollout_metadata() {
         .any(|dir| dir.join("sqlite").join("state_5.sqlite").exists()));
     assert!(backups
         .iter()
-        .any(|dir| dir.join("sessions").join("rollout-test.jsonl").exists()));
-    assert!(backups.iter().any(|dir| dir
-        .join("archived_sessions")
-        .join("rollout-archived.jsonl")
-        .exists()));
+        .all(|dir| !dir.join("sessions").join("rollout-test.jsonl").exists()));
+    assert!(backups.iter().all(|dir| {
+        !dir.join("archived_sessions")
+            .join("rollout-archived.jsonl")
+            .exists()
+    }));
 
     let _ = fs::remove_dir_all(&home);
 }
