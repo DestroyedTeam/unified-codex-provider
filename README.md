@@ -142,6 +142,24 @@ UCP-marked display projection rows, normalizes invalid names on other historical
 tool-call rows, preserves call IDs/output pairing, and restores file modification
 times.
 
+Codex Desktop records injected app items (automation heartbeats and cross-thread
+messages) as standalone `function_call_output` rows without `call_id`. The
+built-in `openai` provider tolerates that shape, but strict third-party
+Responses providers reject the whole request (`missing field call_id`), which
+makes the thread unusable until the rows are repaired:
+
+```bash
+ucp repair-injections
+ucp repair-injections --apply
+```
+
+Dry-run is the default. Apply mode backs up each affected rollout, rewrites the
+injected rows into plain user messages while keeping their text, and restores
+file modification times. `ucp switch` and `ucp sync` also run an incremental
+repair whenever the active provider is not the built-in `openai` provider, so
+threads stay usable on strict providers; OpenAI histories stay untouched unless
+the explicit command is used.
+
 ## Shell Completion
 
 Zsh example:

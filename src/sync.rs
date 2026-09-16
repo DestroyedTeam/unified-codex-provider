@@ -17,6 +17,8 @@ pub struct SyncState {
     pub last_provider: Option<String>,
     pub last_sync: Option<String>,
     pub last_profile_name: Option<String>,
+    #[serde(default)]
+    pub last_injection_scan: Option<u64>,
 }
 
 pub fn load_state() -> SyncState {
@@ -31,14 +33,58 @@ pub fn load_state() -> SyncState {
 }
 
 pub fn save_state(provider: &str, profile_name: &str) -> Result<()> {
+    let previous = load_state();
     let state = SyncState {
         last_provider: Some(provider.to_string()),
         last_sync: Some(Local::now().to_rfc3339()),
         last_profile_name: Some(profile_name.to_string()),
+        last_injection_scan: previous.last_injection_scan,
     };
     let content = serde_json::to_string_pretty(&state)?;
     fs::write(state_file_path(), content)?;
     Ok(())
+}
+
+/// Remember how far an incremental injected-item repair has scanned.
+pub fn record_injection_scan(timestamp: u64) -> Result<()> {
+    let mut state = load_state();
+    state.last_injection_scan = Some(timestamp);
+    let content = serde_json::to_string_pretty(&state)?;
+    fs::write(state_file_path(), content)?;
+    Ok(())
+}
+
+/// Repair injected app items (automation heartbeats, cross-thread messages)
+/// that strict third-party Responses providers reject with
+/// `missing field `call_id``. The built-in `openai` provider tolerates the
+/// original shape, so its histories stay untouched unless the user runs the
+/// explicit `ucp repair-injections --apply` command.
+fn repair_injected_items_for_provider(provider: &str) {
+    if provider == "openai" {
+        return;
+    }
+
+    let since = load_state()
+        .last_injection_scan
+        .map(|seconds| std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds));
+    let started = std::time::SystemTime::now();
+
+    match crate::injections::repair_injected_items(true, since) {
+        Ok(summary) => {
+            if summary.items_repaired > 0 {
+                println!(
+                    "  Injected app items: {} repaired in {} rollout(s)",
+                    summary.items_repaired, summary.rollouts_repaired
+                );
+            }
+            if summary.errors == 0 {
+                if let Ok(elapsed) = started.duration_since(std::time::UNIX_EPOCH) {
+                    let _ = record_injection_scan(elapsed.as_secs());
+                }
+            }
+        }
+        Err(error) => eprintln!("  Warning: injected-item repair skipped: {error}"),
+    }
 }
 
 pub fn clear_state() -> Result<()> {
@@ -93,7 +139,10 @@ pub fn switch_provider(profile_name: &str, rewrite_rollouts: bool) -> Result<()>
         session_summary.db_errors
     );
 
-    // 4. Save state
+    // 4. Repair injected app items that strict third-party providers reject.
+    repair_injected_items_for_provider(&profile.provider.model_provider);
+
+    // 5. Save state
     save_state(&profile.provider.model_provider, profile_name)?;
 
     println!("✓ Switch complete: now using '{}'", profile_name);
@@ -213,6 +262,9 @@ pub fn auto_sync_with_options(rewrite_rollouts: bool) -> Result<()> {
             );
         }
 
+        // Repair injected app items appended while the strict provider was active.
+        repair_injected_items_for_provider(&current_provider);
+
         // Update last_sync timestamp
         save_state(&current_provider, profile_name)?;
         println!("✓ Snapshots updated for '{}'", profile_name);
@@ -279,6 +331,9 @@ pub fn auto_sync_with_options(rewrite_rollouts: bool) -> Result<()> {
             summary.rollout_errors + summary.db_errors
         );
     }
+
+    // Repair injected app items that strict third-party providers reject.
+    repair_injected_items_for_provider(&current_provider);
 
     save_state(&current_provider, &profile_name)?;
     println!("✓ Sync complete for '{}'", profile_name);

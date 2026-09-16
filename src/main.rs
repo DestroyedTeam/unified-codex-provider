@@ -2,6 +2,7 @@ mod auth;
 mod auth_refresh;
 mod config;
 mod history;
+mod injections;
 mod migrate;
 mod oauth;
 mod provider;
@@ -155,6 +156,12 @@ enum Commands {
     },
     /// Scan or repair historical rollout rows rejected by newer Codex versions
     RepairSessions {
+        /// Back up affected rollouts and apply the repair; default is dry-run
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Scan or repair injected app items rejected by strict Responses providers
+    RepairInjections {
         /// Back up affected rollouts and apply the repair; default is dry-run
         #[arg(long)]
         apply: bool,
@@ -381,6 +388,38 @@ fn main() -> Result<()> {
                 println!("  Dry-run only. Re-run with --apply to back up and repair.");
             }
         }
+        Commands::RepairInjections { apply } => {
+            if apply {
+                println!("Repairing injected app items after backing up affected rollouts...");
+            } else {
+                println!("Scanning injected app items (dry-run)...");
+            }
+            let summary = injections::repair_injected_items(apply, None)?;
+            println!(
+                "  Rollouts: {} scanned, {} affected, {} repaired, {} errors",
+                summary.rollouts_scanned,
+                summary.rollouts_affected,
+                summary.rollouts_repaired,
+                summary.errors
+            );
+            if apply {
+                println!("  Items: {} repaired", summary.items_repaired);
+            } else {
+                println!("  Items: {} to repair", summary.items_repaired);
+            }
+            if let Some(backup_dir) = &summary.backup_dir {
+                println!("  Backups: {}", backup_dir.display());
+            } else if !apply && summary.rollouts_affected > 0 {
+                println!("  Dry-run only. Re-run with --apply to back up and repair.");
+            }
+            if apply && summary.errors == 0 && summary.rollouts_repaired > 0 {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs())
+                    .unwrap_or(0);
+                let _ = sync::record_injection_scan(now);
+            }
+        }
         Commands::RebuildHistory => {
             println!("Rebuilding history index from raw rollout JSONL...");
             let summary = history::refresh_history_index_with_options(true)?;
@@ -482,7 +521,7 @@ const BASH_COMPLETION: &str = r#"_ucp()
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "status list switch remove delete rm add init import-auth login sync setup doctor service completions repair-sessions rebuild-history refresh-auth" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "status list switch remove delete rm add init import-auth login sync setup doctor service completions repair-sessions repair-injections rebuild-history refresh-auth" -- "${cur}") )
         return 0
     fi
 
@@ -516,6 +555,9 @@ const BASH_COMPLETION: &str = r#"_ucp()
             COMPREPLY=( $(compgen -W "--auto --refresh-auth --rewrite-rollouts" -- "${cur}") )
             ;;
         repair-sessions)
+            COMPREPLY=( $(compgen -W "--apply" -- "${cur}") )
+            ;;
+        repair-injections)
             COMPREPLY=( $(compgen -W "--apply" -- "${cur}") )
             ;;
         refresh-auth)
@@ -563,6 +605,7 @@ _ucp()
         'service:Manage macOS auto-sync service'
         'completions:Generate shell completion script'
         'repair-sessions:Scan or repair incompatible historical session rows'
+        'repair-injections:Scan or repair injected app items rejected by strict Responses providers'
         'rebuild-history:Rebuild the read-only history audit index'
         'refresh-auth:Proactively refresh stored ChatGPT auth snapshots'
     )
@@ -613,6 +656,9 @@ _ucp()
                         '--refresh-auth[Refresh eligible stored ChatGPT auth snapshots]'
                     ;;
                 repair-sessions)
+                    _arguments '--apply[Back up affected rollouts and apply repairs]'
+                    ;;
+                repair-injections)
                     _arguments '--apply[Back up affected rollouts and apply repairs]'
                     ;;
                 refresh-auth)
@@ -669,6 +715,7 @@ complete -c ucp -n '__fish_is_first_arg' -a 'doctor' -d 'Diagnose local environm
 complete -c ucp -n '__fish_is_first_arg' -a 'service' -d 'Manage macOS auto-sync service'
 complete -c ucp -n '__fish_is_first_arg' -a 'completions' -d 'Generate shell completion script'
 complete -c ucp -n '__fish_is_first_arg' -a 'repair-sessions' -d 'Scan or repair incompatible historical session rows'
+complete -c ucp -n '__fish_is_first_arg' -a 'repair-injections' -d 'Scan or repair injected app items rejected by strict Responses providers'
 complete -c ucp -n '__fish_is_first_arg' -a 'rebuild-history' -d 'Rebuild the read-only history audit index'
 complete -c ucp -n '__fish_is_first_arg' -a 'refresh-auth' -d 'Proactively refresh stored ChatGPT auth snapshots'
 complete -c ucp -n '__fish_seen_subcommand_from switch' -a '(ucp __complete profile (commandline -ct) 2>/dev/null)' -d 'Provider profile'
@@ -683,6 +730,7 @@ complete -c ucp -n '__fish_seen_subcommand_from sync' -l auto -d 'Run LaunchAgen
 complete -c ucp -n '__fish_seen_subcommand_from sync' -l refresh-auth -d 'Refresh eligible stored ChatGPT auth snapshots'
 complete -c ucp -n '__fish_seen_subcommand_from sync' -l rewrite-rollouts -d 'Danger: full rewrite of historical rollout JSONL rows after backup'
 complete -c ucp -n '__fish_seen_subcommand_from repair-sessions' -l apply -d 'Back up affected rollouts and apply repairs'
+complete -c ucp -n '__fish_seen_subcommand_from repair-injections' -l apply -d 'Back up affected rollouts and apply repairs'
 complete -c ucp -n '__fish_seen_subcommand_from refresh-auth' -l all -d 'Refresh all registered profile snapshots'
 complete -c ucp -n '__fish_seen_subcommand_from refresh-auth' -l force -d 'Refresh even if recent or very old'
 complete -c ucp -n '__fish_seen_subcommand_from refresh-auth' -l dry-run -d 'Only print what would be refreshed'

@@ -836,3 +836,168 @@ PY
 
     let _ = fs::remove_dir_all(&home);
 }
+
+fn write_injected_fixture(sessions: &Path, file_name: &str) -> PathBuf {
+    fs::create_dir_all(sessions).expect("create sessions dir");
+    let rollout = sessions.join(file_name);
+    let meta = "{\"timestamp\":\"2026-09-16T09:32:06Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-injections\",\"model_provider\":\"opencode_go\"}}";
+    let heartbeat = "{\"timestamp\":\"2026-09-16T09:32:07Z\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"id\":\"fco_1\",\"name\":\"automation_update\",\"namespace\":\"codex_app\",\"output\":\"<heartbeat>go</heartbeat>\"}}";
+    let mentions = "{\"timestamp\":\"2026-09-16T09:32:08Z\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"output\":\"note: call_id is missing\"}}";
+    let paired = "{\"timestamp\":\"2026-09-16T09:32:09Z\",\"ordinal\":3,\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"ok\"}}";
+    fs::write(
+        &rollout,
+        format!("{meta}\n{heartbeat}\n{mentions}\n{paired}\nnot json\n"),
+    )
+    .expect("write rollout");
+    rollout
+}
+
+fn line_payload(line: &str) -> serde_json::Value {
+    let value: serde_json::Value = serde_json::from_str(line).expect("parse line");
+    value.get("payload").cloned().expect("payload")
+}
+
+#[test]
+fn test_repair_injections_dry_run_then_apply_rewrites_orphan_outputs() {
+    let home = temp_home("repair_injections");
+    let codex = home.join(".codex");
+    let sessions = codex.join("sessions");
+    let rollout = write_injected_fixture(&sessions, "rollout-thread-injections.jsonl");
+    let original = fs::read_to_string(&rollout).expect("read rollout");
+    let original_mtime = fs::metadata(&rollout)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .args(["repair-injections"])
+        .output()
+        .expect("Failed to run ucp repair-injections");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Items: 2 to repair"), "stdout: {stdout}");
+    assert!(stdout.contains("1 affected"), "stdout: {stdout}");
+    assert!(stdout.contains("Dry-run only"), "stdout: {stdout}");
+    assert_eq!(fs::read_to_string(&rollout).unwrap(), original);
+    assert!(session_backup_dirs(&home).is_empty());
+
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .args(["repair-injections", "--apply"])
+        .output()
+        .expect("Failed to run ucp repair-injections --apply");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Items: 2 repaired"), "stdout: {stdout}");
+    assert!(stdout.contains("Backups:"), "stdout: {stdout}");
+
+    let content = fs::read_to_string(&rollout).expect("read repaired rollout");
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 5);
+    let meta = line_payload(lines[0]);
+    assert_eq!(
+        meta.get("id").and_then(|v| v.as_str()),
+        Some("thread-injections")
+    );
+
+    let heartbeat = line_payload(lines[1]);
+    assert_eq!(
+        heartbeat.get("type").and_then(|v| v.as_str()),
+        Some("message")
+    );
+    assert_eq!(heartbeat.get("role").and_then(|v| v.as_str()), Some("user"));
+    assert_eq!(heartbeat.get("id").and_then(|v| v.as_str()), Some("fco_1"));
+    assert_eq!(
+        heartbeat
+            .get("content")
+            .and_then(|content| content.get(0))
+            .and_then(|item| item.get("text"))
+            .and_then(|text| text.as_str()),
+        Some("<heartbeat>go</heartbeat>")
+    );
+
+    let mentions = line_payload(lines[2]);
+    assert_eq!(
+        mentions.get("type").and_then(|v| v.as_str()),
+        Some("message")
+    );
+    assert_eq!(
+        mentions
+            .get("content")
+            .and_then(|content| content.get(0))
+            .and_then(|item| item.get("text"))
+            .and_then(|text| text.as_str()),
+        Some("note: call_id is missing")
+    );
+
+    let paired = line_payload(lines[3]);
+    assert_eq!(
+        paired.get("type").and_then(|v| v.as_str()),
+        Some("function_call_output")
+    );
+    assert_eq!(
+        paired.get("call_id").and_then(|v| v.as_str()),
+        Some("call_1")
+    );
+    assert_eq!(lines[4], "not json");
+
+    let repaired_mtime = fs::metadata(&rollout)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    assert_eq!(repaired_mtime, original_mtime);
+
+    let backups = session_backup_dirs(&home);
+    assert!(backups.iter().any(|dir| dir
+        .join("sessions")
+        .join("rollout-thread-injections.jsonl")
+        .exists()));
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_switch_repairs_injections_for_custom_provider_but_not_openai() {
+    let home = temp_home("switch_injections");
+    write_profile(&home, "custom_target");
+    let codex = home.join(".codex");
+    let providers = codex.join("providers");
+    fs::write(
+        providers.join("openai_native.toml"),
+        "[provider]\nmodel_provider = \"openai\"\nname = \"OpenAI Native\"\nmodel = \"gpt-5.5\"\n",
+    )
+    .expect("write openai profile");
+
+    let sessions = codex.join("sessions");
+    let custom_rollout = write_injected_fixture(&sessions, "rollout-custom.jsonl");
+    create_state_db(&codex.join("state_5.sqlite"), "old", Some("gpt-5.4"));
+
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .args(["switch", "custom_target"])
+        .output()
+        .expect("Failed to run ucp switch");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Injected app items: 2 repaired"),
+        "stdout: {stdout}"
+    );
+    let content = fs::read_to_string(&custom_rollout).expect("read custom rollout");
+    assert!(content.contains("\"type\":\"message\""));
+    assert!(content.contains("<heartbeat>go</heartbeat>"));
+
+    let native_rollout = write_injected_fixture(&sessions, "rollout-native.jsonl");
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .args(["switch", "openai_native"])
+        .output()
+        .expect("Failed to run ucp switch");
+    assert_success(&output);
+    let native_content = fs::read_to_string(&native_rollout).expect("read native rollout");
+    assert!(native_content.contains("\"type\":\"function_call_output\""));
+    assert!(!native_content.contains("\"type\":\"message\""));
+
+    let _ = fs::remove_dir_all(&home);
+}

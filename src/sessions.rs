@@ -531,7 +531,7 @@ fn update_payload(
     }
 }
 
-fn backup_session_file(path: &Path, backup_dir: &Path) -> Result<()> {
+pub(crate) fn backup_session_file(path: &Path, backup_dir: &Path) -> Result<()> {
     let base = codex_dir();
     let relative = path
         .strip_prefix(&base)
@@ -549,7 +549,7 @@ fn backup_session_file(path: &Path, backup_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_session_content_preserving_mtime(
+pub(crate) fn write_session_content_preserving_mtime(
     path: &Path,
     original_content: &str,
     new_lines: Vec<String>,
