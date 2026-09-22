@@ -434,10 +434,21 @@ impl TempCodexHome {
             .duration_since(UNIX_EPOCH)
             .context("system clock before unix epoch")?
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("ucp_auth_refresh_{}_{}", std::process::id(), nanos));
-        fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        loop {
+            let serial = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "ucp_auth_refresh_{}_{}_{}",
+                std::process::id(),
+                nanos,
+                serial
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 }
 

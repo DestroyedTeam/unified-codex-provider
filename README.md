@@ -155,10 +155,34 @@ ucp repair-injections --apply
 
 Dry-run is the default. Apply mode backs up each affected rollout, rewrites the
 injected rows into plain user messages while keeping their text, and restores
-file modification times. `ucp switch` and `ucp sync` also run an incremental
-repair whenever the active provider is not the built-in `openai` provider, so
-threads stay usable on strict providers; OpenAI histories stay untouched unless
-the explicit command is used.
+file modification times. Message IDs use the `msg_` prefix; earlier repairs
+that retained `fco_` IDs are corrected as well. Recognized third-party plaintext
+reasoning with UUID placeholder IDs is preserved as assistant analysis text;
+native encrypted reasoning and UI event records remain unchanged.
+
+`ucp switch` and `ucp sync` run incremental repair for all providers, including
+switches back to OpenAI. A repair-rule version forces a full scan after an
+upgrade so preserved modification times do not hide earlier incompatible rows.
+
+Repair covers ordinary response items and compacted replacement history, including
+invalid historical tool names. Call IDs and arguments remain intact. Unknown
+unpaired tool records are left for manual diagnosis rather than discarded.
+
+Apply mode uses Codex's per-thread writer locks and skips loaded sessions. Closing
+a tab may not unload its session; exit Desktop after other tasks finish, apply
+the repair, then reopen it. Skipped files are persisted in a retry list even if
+their modification times predate the scan watermark. Unchanged rollouts are not
+rewritten. Segmented histories are deferred for manual diagnosis.
+
+Rollouts are streamed to a temporary file, backed up in full, and atomically
+replaced with their original modification times. Existing UI rows remain intact;
+SQLite projection byte checkpoints are backed up and translated to the rewritten
+file. Checkpoint or database errors abort the repair and restore the original
+rollout. Backups are stored under `.codex/.sessions_backup_injections_*`.
+
+A disk repair does not refresh an already-loaded session or intercept newly
+injected heartbeat requests in memory. Verify ordinary replay and compact after
+reopening the affected session; recurring injection requires an upstream fix.
 
 ## Shell Completion
 

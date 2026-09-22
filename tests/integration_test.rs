@@ -842,7 +842,7 @@ fn write_injected_fixture(sessions: &Path, file_name: &str) -> PathBuf {
     let rollout = sessions.join(file_name);
     let meta = "{\"timestamp\":\"2026-09-16T09:32:06Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-injections\",\"model_provider\":\"opencode_go\"}}";
     let heartbeat = "{\"timestamp\":\"2026-09-16T09:32:07Z\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"id\":\"fco_1\",\"name\":\"automation_update\",\"namespace\":\"codex_app\",\"output\":\"<heartbeat>go</heartbeat>\"}}";
-    let mentions = "{\"timestamp\":\"2026-09-16T09:32:08Z\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"output\":\"note: call_id is missing\"}}";
+    let mentions = "{\"timestamp\":\"2026-09-16T09:32:08Z\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"namespace\":\"codex_app\",\"name\":\"automation_update\",\"output\":\"note: call_id is missing\"}}";
     let paired = "{\"timestamp\":\"2026-09-16T09:32:09Z\",\"ordinal\":3,\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"ok\"}}";
     fs::write(
         &rollout,
@@ -907,7 +907,7 @@ fn test_repair_injections_dry_run_then_apply_rewrites_orphan_outputs() {
         Some("message")
     );
     assert_eq!(heartbeat.get("role").and_then(|v| v.as_str()), Some("user"));
-    assert_eq!(heartbeat.get("id").and_then(|v| v.as_str()), Some("fco_1"));
+    assert_eq!(heartbeat.get("id").and_then(|v| v.as_str()), Some("msg_1"));
     assert_eq!(
         heartbeat
             .get("content")
@@ -958,7 +958,7 @@ fn test_repair_injections_dry_run_then_apply_rewrites_orphan_outputs() {
 }
 
 #[test]
-fn test_switch_repairs_injections_for_custom_provider_but_not_openai() {
+fn test_switch_repairs_injections_for_custom_provider_and_openai() {
     let home = temp_home("switch_injections");
     write_profile(&home, "custom_target");
     let codex = home.join(".codex");
@@ -989,6 +989,12 @@ fn test_switch_repairs_injections_for_custom_provider_but_not_openai() {
     assert!(content.contains("<heartbeat>go</heartbeat>"));
 
     let native_rollout = write_injected_fixture(&sessions, "rollout-native.jsonl");
+    // An old watermark must not hide files repaired under the old rules.
+    fs::write(
+        codex.join(".ucp_state.json"),
+        r#"{"last_injection_scan":4102444800}"#,
+    )
+    .unwrap();
     let output = Command::new(ucp_bin())
         .env("HOME", &home)
         .args(["switch", "openai_native"])
@@ -997,7 +1003,206 @@ fn test_switch_repairs_injections_for_custom_provider_but_not_openai() {
     assert_success(&output);
     let native_content = fs::read_to_string(&native_rollout).expect("read native rollout");
     assert!(native_content.contains("\"type\":\"function_call_output\""));
-    assert!(!native_content.contains("\"type\":\"message\""));
+    assert!(native_content.contains("\"type\":\"message\""));
 
     let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_repair_respects_writer_lock_and_retries_old_rollouts() {
+    use fs2::FileExt;
+    let home = temp_home("locked_repair");
+    write_profile(&home, "custom");
+    let codex = home.join(".codex");
+    let rollout = write_injected_fixture(&codex.join("sessions"), "rollout-locked.jsonl");
+    let original = fs::read(&rollout).unwrap();
+    let state = r#"{"last_injection_scan":4102444800,"injection_repair_version":2}"#;
+    fs::write(codex.join(".ucp_state.json"), state).unwrap();
+    fs::create_dir_all(codex.join("thread-writer-locks")).unwrap();
+    let lock = fs::File::create(codex.join("thread-writer-locks/thread-injections.lock")).unwrap();
+    lock.lock_exclusive().unwrap();
+    let run = || {
+        Command::new(ucp_bin())
+            .env("HOME", &home)
+            .args(["switch", "custom"])
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("active rollout(s) deferred"));
+    assert_eq!(fs::read(&rollout).unwrap(), original);
+    assert!(session_backup_dirs(&home).is_empty());
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(codex.join(".ucp_state.json")).unwrap()).unwrap();
+    assert_eq!(state["injection_repair_version"], 3);
+    assert_eq!(
+        state["deferred_injection_rollouts"][0],
+        rollout.to_string_lossy().as_ref()
+    );
+    // Preserved old mtimes are still retried through the deferred-file list.
+    filetime::set_file_mtime(&rollout, filetime::FileTime::from_unix_time(100, 0)).unwrap();
+    drop(lock);
+    assert_success(&run());
+    assert_ne!(fs::read(&rollout).unwrap(), original);
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(codex.join(".ucp_state.json")).unwrap()).unwrap();
+    assert_eq!(state["injection_repair_version"], 3);
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn test_repair_preserves_ui_rows_and_translates_checkpoint_with_backup() {
+    let home = temp_home("projection_repair");
+    let codex = home.join(".codex");
+    let rollout = write_injected_fixture(&codex.join("sessions"), "rollout-ui.jsonl");
+    let original = fs::read_to_string(&rollout).unwrap().replace('\n', "\r\n");
+    let ui =
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"keep UI\"}}";
+    let original = format!("{original}{ui}"); // no final newline
+    fs::write(&rollout, &original).unwrap();
+    let archive = codex.join("archived_sessions/rollout-ui-archived-copy.jsonl");
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    fs::write(&archive, &original).unwrap();
+    let old_mtime = filetime::FileTime::from_unix_time(1234567890, 123456000);
+    filetime::set_file_mtime(&rollout, old_mtime).unwrap();
+    let state = Connection::open(codex.join("state_5.sqlite")).unwrap();
+    state
+        .execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT);")
+        .unwrap();
+    state
+        .execute(
+            "INSERT INTO threads VALUES('thread-injections', ?1)",
+            [rollout.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    let conn = Connection::open(codex.join("thread_history_1.sqlite")).unwrap();
+    conn.execute_batch("CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER); CREATE TABLE thread_items(thread_id TEXT, item TEXT);").unwrap();
+    conn.execute(
+        "INSERT INTO thread_history_projection_state VALUES('thread-injections', ?1, 7)",
+        [original.len() as i64],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO thread_history_projection_state VALUES('unrelated', 42, 3)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO thread_items VALUES('thread-injections', 'legacy UI without ordinals')",
+        [],
+    )
+    .unwrap();
+    let run = || {
+        Command::new(ucp_bin())
+            .env("HOME", &home)
+            .args(["repair-injections", "--apply"])
+            .output()
+            .unwrap()
+    };
+    assert_success(&run());
+    let repaired = fs::read_to_string(&rollout).unwrap();
+    assert!(repaired.ends_with(ui));
+    assert_eq!(fs::read_to_string(&archive).unwrap(), repaired);
+    assert_eq!(
+        repaired.matches("\r\n").count(),
+        original.matches("\r\n").count()
+    );
+    assert_eq!(
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&rollout).unwrap()),
+        old_mtime
+    );
+    let (offset, ordinal): (i64, i64) = conn.query_row("SELECT next_rollout_byte_offset, next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id='thread-injections'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(offset, repaired.len() as i64);
+    assert_eq!(ordinal, 7);
+    let unrelated: i64 = conn.query_row("SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id='unrelated'", [], |r| r.get(0)).unwrap();
+    assert_eq!(unrelated, 42);
+    let item: String = conn
+        .query_row("SELECT item FROM thread_items", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(item, "legacy UI without ordinals");
+    let backups = session_backup_dirs(&home);
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        fs::read_to_string(backups[0].join("sessions/rollout-ui.jsonl")).unwrap(),
+        original
+    );
+    let backup_db = Connection::open(backups[0].join("projection.sqlite")).unwrap();
+    let saved: i64 = backup_db
+        .query_row(
+            "SELECT next_rollout_byte_offset FROM history0_projection_state",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(saved, original.len() as i64);
+    assert_success(&run());
+    assert_eq!(fs::read_to_string(&rollout).unwrap(), repaired);
+    assert_eq!(session_backup_dirs(&home).len(), 1);
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn test_repair_failure_restores_source_and_keeps_checkpoint() {
+    let home = temp_home("projection_failure");
+    let codex = home.join(".codex");
+    let rollout = write_injected_fixture(&codex.join("sessions"), "rollout-failure.jsonl");
+    let original = fs::read_to_string(&rollout).unwrap();
+    let offset = original.find("fco_1").unwrap() as i64;
+    let state = Connection::open(codex.join("state_5.sqlite")).unwrap();
+    state
+        .execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT);")
+        .unwrap();
+    state
+        .execute(
+            "INSERT INTO threads VALUES('thread-injections', ?1)",
+            [rollout.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    let conn = Connection::open(codex.join("thread_history_1.sqlite")).unwrap();
+    conn.execute_batch("CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER);").unwrap();
+    conn.execute(
+        "INSERT INTO thread_history_projection_state VALUES('thread-injections', ?1)",
+        [offset],
+    )
+    .unwrap();
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .args(["repair-injections", "--apply"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(fs::read_to_string(&rollout).unwrap(), original);
+    let after: i64 = conn
+        .query_row(
+            "SELECT next_rollout_byte_offset FROM thread_history_projection_state",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(after, offset);
+    assert!(!codex.join(".ucp_state.json").exists());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn test_segmented_history_is_deferred_without_modification() {
+    let home = temp_home("segmented_repair");
+    let codex = home.join(".codex");
+    let rollout = write_injected_fixture(&codex.join("sessions"), "rollout-segmented.jsonl");
+    let original = fs::read_to_string(&rollout).unwrap().replace(
+        "\"id\":\"thread-injections\"",
+        "\"id\":\"thread-injections\",\"history_base\":{\"end_ordinal_exclusive\":100}",
+    );
+    fs::write(&rollout, &original).unwrap();
+    let output = Command::new(ucp_bin())
+        .env("HOME", &home)
+        .args(["repair-injections", "--apply"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("segmented history"));
+    assert_eq!(fs::read_to_string(&rollout).unwrap(), original);
+    assert!(!codex.join(".ucp_state.json").exists());
+    fs::remove_dir_all(home).unwrap();
 }

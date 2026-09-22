@@ -348,14 +348,14 @@ fn repair_rollout_file(path: &Path, backup_dir: &Path, apply: bool) -> Result<Re
     Ok(result)
 }
 
-fn is_valid_tool_name(name: &str) -> bool {
+pub(crate) fn is_valid_tool_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
-fn normalize_tool_name(name: &str) -> String {
+pub(crate) fn normalize_tool_name(name: &str) -> String {
     let mut normalized = String::with_capacity(name.len());
     let mut last_was_separator = false;
     for character in name.chars() {

@@ -19,6 +19,10 @@ pub struct SyncState {
     pub last_profile_name: Option<String>,
     #[serde(default)]
     pub last_injection_scan: Option<u64>,
+    #[serde(default)]
+    pub injection_repair_version: u32,
+    #[serde(default)]
+    pub deferred_injection_rollouts: Vec<std::path::PathBuf>,
 }
 
 pub fn load_state() -> SyncState {
@@ -39,6 +43,8 @@ pub fn save_state(provider: &str, profile_name: &str) -> Result<()> {
         last_sync: Some(Local::now().to_rfc3339()),
         last_profile_name: Some(profile_name.to_string()),
         last_injection_scan: previous.last_injection_scan,
+        injection_repair_version: previous.injection_repair_version,
+        deferred_injection_rollouts: previous.deferred_injection_rollouts,
     };
     let content = serde_json::to_string_pretty(&state)?;
     fs::write(state_file_path(), content)?;
@@ -46,30 +52,32 @@ pub fn save_state(provider: &str, profile_name: &str) -> Result<()> {
 }
 
 /// Remember how far an incremental injected-item repair has scanned.
-pub fn record_injection_scan(timestamp: u64) -> Result<()> {
+pub fn record_injection_scan(timestamp: u64, deferred: Vec<std::path::PathBuf>) -> Result<()> {
     let mut state = load_state();
     state.last_injection_scan = Some(timestamp);
+    state.injection_repair_version = crate::injections::REPAIR_VERSION;
+    state.deferred_injection_rollouts = deferred;
     let content = serde_json::to_string_pretty(&state)?;
     fs::write(state_file_path(), content)?;
     Ok(())
 }
 
 /// Repair injected app items (automation heartbeats, cross-thread messages)
-/// that strict third-party Responses providers reject with
-/// `missing field `call_id``. The built-in `openai` provider tolerates the
-/// original shape, so its histories stay untouched unless the user runs the
-/// explicit `ucp repair-injections --apply` command.
+/// and third-party plaintext reasoning before replay to any provider.
+/// Rule-version changes force a full scan despite preserved rollout mtimes.
 fn repair_injected_items_for_provider(provider: &str) {
-    if provider == "openai" {
-        return;
-    }
-
-    let since = load_state()
-        .last_injection_scan
-        .map(|seconds| std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds));
+    let _ = provider; // Switching back to OpenAI also needs compatible history.
+    let state = load_state();
+    let since = if state.injection_repair_version == crate::injections::REPAIR_VERSION {
+        state
+            .last_injection_scan
+            .map(|seconds| std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+    } else {
+        None // Rules changed: old repairs preserve mtime and must be rescanned.
+    };
     let started = std::time::SystemTime::now();
 
-    match crate::injections::repair_injected_items(true, since) {
+    match crate::injections::repair_with_deferred(true, since, &state.deferred_injection_rollouts) {
         Ok(summary) => {
             if summary.items_repaired > 0 {
                 println!(
@@ -77,9 +85,15 @@ fn repair_injected_items_for_provider(provider: &str) {
                     summary.items_repaired, summary.rollouts_repaired
                 );
             }
+            if summary.skipped_active > 0 {
+                println!(
+                    "  History repair: {} active rollout(s) deferred for retry",
+                    summary.skipped_active
+                );
+            }
             if summary.errors == 0 {
                 if let Ok(elapsed) = started.duration_since(std::time::UNIX_EPOCH) {
-                    let _ = record_injection_scan(elapsed.as_secs());
+                    let _ = record_injection_scan(elapsed.as_secs(), summary.deferred_rollouts);
                 }
             }
         }

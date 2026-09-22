@@ -394,7 +394,9 @@ fn main() -> Result<()> {
             } else {
                 println!("Scanning injected app items (dry-run)...");
             }
+            let started = std::time::SystemTime::now();
             let summary = injections::repair_injected_items(apply, None)?;
+            println!("  Active rollout(s) deferred: {}", summary.skipped_active);
             println!(
                 "  Rollouts: {} scanned, {} affected, {} repaired, {} errors",
                 summary.rollouts_scanned,
@@ -412,13 +414,17 @@ fn main() -> Result<()> {
             } else if !apply && summary.rollouts_affected > 0 {
                 println!("  Dry-run only. Re-run with --apply to back up and repair.");
             }
-            if apply && summary.errors == 0 && summary.rollouts_repaired > 0 {
-                let now = std::time::SystemTime::now()
+            if apply && summary.errors == 0 {
+                let now = started
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|elapsed| elapsed.as_secs())
                     .unwrap_or(0);
-                let _ = sync::record_injection_scan(now);
+                sync::record_injection_scan(now, summary.deferred_rollouts)?;
             }
+            anyhow::ensure!(
+                summary.errors == 0,
+                "Some rollout repairs failed; see errors above"
+            );
         }
         Commands::RebuildHistory => {
             println!("Rebuilding history index from raw rollout JSONL...");
