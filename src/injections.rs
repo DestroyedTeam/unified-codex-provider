@@ -20,6 +20,7 @@ pub struct InjectionRepairSummary {
     pub rollouts_repaired: usize,
     pub items_repaired: usize,
     pub errors: usize,
+    pub traversal_errors: usize,
     pub skipped_active: usize,
     pub deferred_rollouts: Vec<PathBuf>,
     pub backup_dir: Option<PathBuf>,
@@ -58,6 +59,7 @@ pub fn repair_with_deferred(
                 Ok(entry) => entry,
                 Err(_) => {
                     summary.errors += 1;
+                    summary.traversal_errors += 1;
                     continue;
                 }
             };
@@ -78,6 +80,7 @@ pub fn repair_with_deferred(
                     Ok(value) => value,
                     Err(_) => {
                         summary.errors += 1;
+                        summary.deferred_rollouts.push(path.to_path_buf());
                         continue;
                     }
                 };
@@ -107,6 +110,7 @@ pub fn repair_with_deferred(
                         path.display()
                     );
                     summary.errors += 1;
+                    summary.deferred_rollouts.push(path.to_path_buf());
                 }
             }
         }

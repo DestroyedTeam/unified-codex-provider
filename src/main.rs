@@ -414,7 +414,7 @@ fn main() -> Result<()> {
             } else if !apply && summary.rollouts_affected > 0 {
                 println!("  Dry-run only. Re-run with --apply to back up and repair.");
             }
-            if apply && summary.errors == 0 {
+            if apply && summary.traversal_errors == 0 {
                 let now = started
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|elapsed| elapsed.as_secs())

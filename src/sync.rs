@@ -91,7 +91,7 @@ fn repair_injected_items_for_provider(provider: &str) {
                     summary.skipped_active
                 );
             }
-            if summary.errors == 0 {
+            if summary.traversal_errors == 0 {
                 if let Ok(elapsed) = started.duration_since(std::time::UNIX_EPOCH) {
                     let _ = record_injection_scan(elapsed.as_secs(), summary.deferred_rollouts);
                 }

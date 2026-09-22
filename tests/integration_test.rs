@@ -1181,7 +1181,12 @@ fn test_repair_failure_restores_source_and_keeps_checkpoint() {
         )
         .unwrap();
     assert_eq!(after, offset);
-    assert!(!codex.join(".ucp_state.json").exists());
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(codex.join(".ucp_state.json")).unwrap()).unwrap();
+    assert_eq!(
+        state["deferred_injection_rollouts"][0],
+        rollout.to_string_lossy().as_ref()
+    );
     fs::remove_dir_all(home).unwrap();
 }
 
@@ -1203,6 +1208,11 @@ fn test_segmented_history_is_deferred_without_modification() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("segmented history"));
     assert_eq!(fs::read_to_string(&rollout).unwrap(), original);
-    assert!(!codex.join(".ucp_state.json").exists());
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(codex.join(".ucp_state.json")).unwrap()).unwrap();
+    assert_eq!(
+        state["deferred_injection_rollouts"][0],
+        rollout.to_string_lossy().as_ref()
+    );
     fs::remove_dir_all(home).unwrap();
 }
